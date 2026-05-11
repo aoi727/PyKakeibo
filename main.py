@@ -47,6 +47,7 @@ ACCOUNT_TYPES = {
     "bank": "普通預金",
     "deposit": "定期預金等",
     "pay": "Pay支払",
+    "credit_card": "クレジットカード",
 }
 
 
@@ -324,7 +325,8 @@ class KakeiboStore:
                         WHEN 'bank' THEN 1
                         WHEN 'deposit' THEN 2
                         WHEN 'pay' THEN 3
-                        ELSE 4
+                        WHEN 'credit_card' THEN 4
+                        ELSE 5
                     END,
                     id
                 """
@@ -620,7 +622,16 @@ class KakeiboStore:
         for account in self.list_accounts(active_only=False):
             opening_net_assets += self.account_balance_before(account.id, month_start)
             ending_balance = self.account_balance_before(account.id, next_month_start)
-            if ending_balance != 0:
+            if account.account_type == "credit_card" and ending_balance < 0:
+                rows.append(
+                    TrialBalanceRow(
+                        section="負債",
+                        name=account.name,
+                        debit=0,
+                        credit=-ending_balance,
+                    )
+                )
+            elif ending_balance != 0:
                 rows.append(
                     TrialBalanceRow(
                         section="資産",
@@ -797,7 +808,7 @@ class KakeiboWindow(QMainWindow):
         self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.resize(1160, 760)
 
-        self.assets_card = SummaryCard("総資産", "¥0", "#7EC8A4")
+        self.assets_card = SummaryCard("純資産", "¥0", "#7EC8A4")
         self.expense_card = SummaryCard("今月の支出", "¥0", "#F28C8C")
         self.income_card = SummaryCard("今月の収入", "¥0", "#7AA7E8")
         self.month_label = QLabel()
@@ -858,8 +869,8 @@ class KakeiboWindow(QMainWindow):
         for key, label in ACCOUNT_TYPES.items():
             self.account_type.addItem(label, key)
         self.account_name = QLineEdit()
-        self.account_name.setPlaceholderText("例: 普通預金3、Pay支払2")
-        self.account_opening = self._amount_input(allow_zero=True)
+        self.account_name.setPlaceholderText("例: 普通預金3、Pay支払2、クレジットカード")
+        self.account_opening = self._balance_input()
 
         self.memo_template_input = QLineEdit()
         self.memo_template_input.setPlaceholderText("例: スーパー、家賃、カード引落")
@@ -883,6 +894,13 @@ class KakeiboWindow(QMainWindow):
     def _amount_input(self, allow_zero: bool = False) -> QSpinBox:
         widget = QSpinBox()
         widget.setRange(0 if allow_zero else 1, 100_000_000)
+        widget.setPrefix("¥ ")
+        widget.setSingleStep(1000)
+        return widget
+
+    def _balance_input(self) -> QSpinBox:
+        widget = QSpinBox()
+        widget.setRange(-100_000_000, 100_000_000)
         widget.setPrefix("¥ ")
         widget.setSingleStep(1000)
         return widget
@@ -972,7 +990,7 @@ class KakeiboWindow(QMainWindow):
         layout.setSpacing(14)
 
         asset_header = QHBoxLayout()
-        title = QLabel("資産残高")
+        title = QLabel("口座残高")
         title.setObjectName("smallSectionTitle")
         asset_header.addWidget(title)
         asset_header.addStretch()
@@ -1590,9 +1608,9 @@ class KakeiboWindow(QMainWindow):
             month_start,
             next_month_start,
         )
-        total_assets = sum(account.balance for account in self.accounts)
+        net_assets = sum(account.balance for account in self.accounts)
 
-        self.assets_card.set_value(f"¥{total_assets:,}")
+        self.assets_card.set_value(f"¥{net_assets:,}")
         self.expense_card.set_value(f"¥{expense_total:,}")
         self.income_card.set_value(f"¥{income_total:,}")
         self._render_category_breakdown(by_category, expense_total)

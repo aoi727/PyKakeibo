@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import sqlite3
 import sys
+from html import escape
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen
+from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QTextDocument
+from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QDateEdit,
+    QFileDialog,
     QFrame,
     QGridLayout,
     QHBoxLayout,
@@ -24,6 +27,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSplitter,
     QSpinBox,
     QTabWidget,
     QTableWidget,
@@ -116,6 +120,26 @@ class Transaction:
     to_account_name: str
     memo: str
     amount: int
+
+
+@dataclass(frozen=True)
+class LedgerEntry:
+    transaction_id: int | None
+    occurred_on: str
+    transaction_type: str
+    description: str
+    memo: str
+    withdrawal: int
+    deposit: int
+    balance: int
+
+
+@dataclass(frozen=True)
+class TrialBalanceRow:
+    section: str
+    name: str
+    debit: int
+    credit: int
 
 
 @dataclass(frozen=True)
@@ -342,6 +366,116 @@ class KakeiboStore:
                     balances[to_id] = balances.get(to_id, 0) + amount
         return balances
 
+    def account_balance_before(self, account_id: int, before_date: date) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT opening_balance FROM accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            if row is None:
+                return 0
+            balance = int(row["opening_balance"])
+            rows = conn.execute(
+                """
+                SELECT transaction_type, from_account_id, to_account_id, amount
+                FROM transactions
+                WHERE occurred_on < ?
+                  AND (from_account_id = ? OR to_account_id = ?)
+                ORDER BY occurred_on, id
+                """,
+                (before_date.isoformat(), account_id, account_id),
+            ).fetchall()
+
+        for row in rows:
+            amount = int(row["amount"])
+            if row["transaction_type"] == "expense" and row["from_account_id"] == account_id:
+                balance -= amount
+            elif row["transaction_type"] == "income" and row["to_account_id"] == account_id:
+                balance += amount
+            elif row["transaction_type"] == "transfer":
+                if row["from_account_id"] == account_id:
+                    balance -= amount
+                elif row["to_account_id"] == account_id:
+                    balance += amount
+        return balance
+
+    def account_ledger(self, account_id: int, month_start: date, next_month_start: date) -> list[LedgerEntry]:
+        balance = self.account_balance_before(account_id, month_start)
+        entries = [
+            LedgerEntry(
+                transaction_id=None,
+                occurred_on=month_start.isoformat(),
+                transaction_type="opening",
+                description="前月繰越",
+                memo="",
+                withdrawal=0,
+                deposit=0,
+                balance=balance,
+            )
+        ]
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT
+                    t.id,
+                    t.occurred_on,
+                    t.transaction_type,
+                    COALESCE(t.category, '') AS category,
+                    t.from_account_id,
+                    t.to_account_id,
+                    COALESCE(f.name, '') AS from_account_name,
+                    COALESCE(ta.name, '') AS to_account_name,
+                    t.memo,
+                    t.amount
+                FROM transactions t
+                LEFT JOIN accounts f ON f.id = t.from_account_id
+                LEFT JOIN accounts ta ON ta.id = t.to_account_id
+                WHERE t.occurred_on >= ?
+                  AND t.occurred_on < ?
+                  AND (t.from_account_id = ? OR t.to_account_id = ?)
+                ORDER BY t.occurred_on, t.id
+                """,
+                (
+                    month_start.isoformat(),
+                    next_month_start.isoformat(),
+                    account_id,
+                    account_id,
+                ),
+            ).fetchall()
+
+        for row in rows:
+            amount = int(row["amount"])
+            withdrawal = 0
+            deposit = 0
+            tx_type = row["transaction_type"]
+            if tx_type == "expense":
+                withdrawal = amount
+                description = row["category"] or "支出"
+            elif tx_type == "income":
+                deposit = amount
+                description = row["category"] or "収入"
+            elif row["from_account_id"] == account_id:
+                withdrawal = amount
+                description = f"振替 → {row['to_account_name']}"
+            else:
+                deposit = amount
+                description = f"振替 ← {row['from_account_name']}"
+
+            balance += deposit - withdrawal
+            entries.append(
+                LedgerEntry(
+                    transaction_id=int(row["id"]),
+                    occurred_on=row["occurred_on"],
+                    transaction_type=tx_type,
+                    description=description,
+                    memo=row["memo"],
+                    withdrawal=withdrawal,
+                    deposit=deposit,
+                    balance=balance,
+                )
+            )
+        return entries
+
     def add_expense(self, occurred_on: str, account_id: int, category: str, memo: str, amount: int) -> None:
         self._add_transaction(occurred_on, "expense", category, account_id, None, memo, amount)
 
@@ -424,10 +558,19 @@ class KakeiboStore:
             if template.usage_type in ("common", usage_type)
         ]
 
-    def list_transactions(self) -> list[Transaction]:
+    def list_transactions(
+        self,
+        month_start: date | None = None,
+        next_month_start: date | None = None,
+    ) -> list[Transaction]:
+        where = ""
+        params: tuple[str, ...] = ()
+        if month_start is not None and next_month_start is not None:
+            where = "WHERE t.occurred_on >= ? AND t.occurred_on < ?"
+            params = (month_start.isoformat(), next_month_start.isoformat())
         with self._connect() as conn:
             rows = conn.execute(
-                """
+                f"""
                 SELECT
                     t.id,
                     t.occurred_on,
@@ -440,16 +583,114 @@ class KakeiboStore:
                 FROM transactions t
                 LEFT JOIN accounts f ON f.id = t.from_account_id
                 LEFT JOIN accounts ta ON ta.id = t.to_account_id
+                {where}
                 ORDER BY t.occurred_on DESC, t.id DESC
-                """
+                """,
+                params,
             ).fetchall()
         return [Transaction(**dict(row)) for row in rows]
+
+    def monthly_totals(self, month_start: date, next_month_start: date) -> tuple[int, int, dict[str, int]]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT transaction_type, COALESCE(category, '') AS category, SUM(amount) AS total
+                FROM transactions
+                WHERE occurred_on >= ? AND occurred_on < ?
+                GROUP BY transaction_type, COALESCE(category, '')
+                """,
+                (month_start.isoformat(), next_month_start.isoformat()),
+            ).fetchall()
+
+        expense_total = 0
+        income_total = 0
+        by_category: dict[str, int] = {}
+        for row in rows:
+            total = int(row["total"] or 0)
+            if row["transaction_type"] == "expense":
+                expense_total += total
+                by_category[row["category"]] = by_category.get(row["category"], 0) + total
+            elif row["transaction_type"] == "income":
+                income_total += total
+        return expense_total, income_total, by_category
+
+    def trial_balance(self, month_start: date, next_month_start: date) -> list[TrialBalanceRow]:
+        rows: list[TrialBalanceRow] = []
+        opening_net_assets = 0
+        for account in self.list_accounts(active_only=False):
+            opening_net_assets += self.account_balance_before(account.id, month_start)
+            ending_balance = self.account_balance_before(account.id, next_month_start)
+            if ending_balance != 0:
+                rows.append(
+                    TrialBalanceRow(
+                        section="資産",
+                        name=account.name,
+                        debit=max(ending_balance, 0),
+                        credit=max(-ending_balance, 0),
+                    )
+                )
+
+        if opening_net_assets > 0:
+            rows.append(
+                TrialBalanceRow(
+                    section="純資産",
+                    name="期首純資産",
+                    debit=0,
+                    credit=opening_net_assets,
+                )
+            )
+        elif opening_net_assets < 0:
+            rows.append(
+                TrialBalanceRow(
+                    section="純資産",
+                    name="期首純資産",
+                    debit=-opening_net_assets,
+                    credit=0,
+                )
+            )
+
+        with self._connect() as conn:
+            category_rows = conn.execute(
+                """
+                SELECT transaction_type, COALESCE(category, '') AS category, SUM(amount) AS total
+                FROM transactions
+                WHERE occurred_on >= ? AND occurred_on < ?
+                  AND transaction_type IN ('expense', 'income')
+                GROUP BY transaction_type, COALESCE(category, '')
+                ORDER BY transaction_type, category
+                """,
+                (month_start.isoformat(), next_month_start.isoformat()),
+            ).fetchall()
+
+        for row in category_rows:
+            amount = int(row["total"] or 0)
+            category = row["category"] or "未分類"
+            if row["transaction_type"] == "expense":
+                rows.append(
+                    TrialBalanceRow(
+                        section="費用",
+                        name=category,
+                        debit=amount,
+                        credit=0,
+                    )
+                )
+            elif row["transaction_type"] == "income":
+                rows.append(
+                    TrialBalanceRow(
+                        section="収益",
+                        name=category,
+                        debit=0,
+                        credit=amount,
+                    )
+                )
+        return rows
 
 
 class SummaryCard(QFrame):
     def __init__(self, title: str, value: str, accent: str | None = None) -> None:
         super().__init__()
         self.setObjectName("summaryCard")
+        self.title_label = QLabel(title)
         self.value_label = QLabel(value)
         self.value_label.setObjectName("cardValue")
         if accent:
@@ -467,8 +708,11 @@ class SummaryCard(QFrame):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(18, 14, 18, 16)
         layout.setSpacing(6)
-        layout.addWidget(QLabel(title))
+        layout.addWidget(self.title_label)
         layout.addWidget(self.value_label)
+
+    def set_title(self, title: str) -> None:
+        self.title_label.setText(title)
 
     def set_value(self, value: str) -> None:
         self.value_label.setText(value)
@@ -547,6 +791,7 @@ class KakeiboWindow(QMainWindow):
         self.accounts: list[Account] = []
         self.managed_accounts: list[Account] = []
         self.transactions: list[Transaction] = []
+        self.selected_month = date.today().replace(day=1)
 
         self.setWindowTitle("My家計簿")
         self.setWindowIcon(QIcon(str(ICON_PATH)))
@@ -555,6 +800,16 @@ class KakeiboWindow(QMainWindow):
         self.assets_card = SummaryCard("総資産", "¥0", "#7EC8A4")
         self.expense_card = SummaryCard("今月の支出", "¥0", "#F28C8C")
         self.income_card = SummaryCard("今月の収入", "¥0", "#7AA7E8")
+        self.month_label = QLabel()
+        self.month_label.setObjectName("monthLabel")
+        self.history_label = QLabel()
+        self.history_label.setObjectName("sectionTitle")
+        self.category_title = QLabel()
+        self.category_title.setObjectName("sectionTitle")
+        self.ledger_account = QComboBox()
+        self.ledger_account.currentIndexChanged.connect(lambda _index: self._render_account_ledger())
+        self.ledger_table = self._ledger_table()
+        self.trial_balance_table = self._trial_balance_table()
 
         self.account_container = QWidget()
         self.account_scroll_content = QWidget()
@@ -652,6 +907,16 @@ class KakeiboWindow(QMainWindow):
         title_group.addWidget(title)
         hero.addLayout(title_group)
         hero.addStretch()
+        previous_month_button = QPushButton("前月")
+        previous_month_button.clicked.connect(self.show_previous_month)
+        current_month_button = QPushButton("今月")
+        current_month_button.clicked.connect(self.show_current_month)
+        next_month_button = QPushButton("翌月")
+        next_month_button.clicked.connect(self.show_next_month)
+        hero.addWidget(previous_month_button)
+        hero.addWidget(self.month_label)
+        hero.addWidget(current_month_button)
+        hero.addWidget(next_month_button)
         layout.addLayout(hero)
 
         cards = QGridLayout()
@@ -661,11 +926,15 @@ class KakeiboWindow(QMainWindow):
         cards.addWidget(self.income_card, 0, 2)
         layout.addLayout(cards)
 
-        content = QHBoxLayout()
-        content.setSpacing(18)
-        content.addWidget(self._build_left_panel(), 3)
-        content.addWidget(self._build_right_panel(), 2)
-        layout.addLayout(content, 1)
+        content = QSplitter(Qt.Horizontal)
+        content.setObjectName("mainSplitter")
+        content.setChildrenCollapsible(False)
+        content.addWidget(self._build_left_panel())
+        content.addWidget(self._build_right_panel())
+        content.setStretchFactor(0, 3)
+        content.setStretchFactor(1, 2)
+        content.setSizes([700, 430])
+        layout.addWidget(content, 1)
         return root
 
     def _build_left_panel(self) -> QWidget:
@@ -679,16 +948,16 @@ class KakeiboWindow(QMainWindow):
         tabs.addTab(self._expense_tab(), "支出")
         tabs.addTab(self._income_tab(), "収入")
         tabs.addTab(self._transfer_tab(), "資金移動")
+        tabs.addTab(self._ledger_tab(), "口座元帳")
+        tabs.addTab(self._trial_balance_tab(), "試算表")
         tabs.addTab(self._account_tab(), "口座管理")
         tabs.addTab(self._memo_dictionary_tab(), "摘要辞書")
 
         layout.addWidget(tabs)
         history_header = QHBoxLayout()
-        history_label = QLabel("履歴")
-        history_label.setObjectName("sectionTitle")
         delete_button = QPushButton("選択行を削除")
         delete_button.clicked.connect(self.delete_selected_transaction)
-        history_header.addWidget(history_label)
+        history_header.addWidget(self.history_label)
         history_header.addStretch()
         history_header.addWidget(delete_button)
         layout.addLayout(history_header)
@@ -709,9 +978,6 @@ class KakeiboWindow(QMainWindow):
         asset_header.addStretch()
         asset_header.addWidget(self.asset_toggle)
 
-        category_title = QLabel("今月の支出内訳")
-        category_title.setObjectName("sectionTitle")
-
         category_scroll = QScrollArea()
         category_scroll.setObjectName("categoryScroll")
         category_scroll.setWidgetResizable(True)
@@ -721,7 +987,7 @@ class KakeiboWindow(QMainWindow):
         layout.addLayout(asset_header)
         layout.addWidget(self.account_container)
         layout.addSpacing(8)
-        layout.addWidget(category_title)
+        layout.addWidget(self.category_title)
         layout.addWidget(category_scroll, 1)
         return panel
 
@@ -795,6 +1061,32 @@ class KakeiboWindow(QMainWindow):
         layout.addWidget(QLabel("金額"), 2, 0)
         layout.addWidget(self.transfer_amount, 2, 1)
         layout.addWidget(add_button, 2, 3)
+        return tab
+
+    def _ledger_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("口座"))
+        controls.addWidget(self.ledger_account)
+        controls.addStretch()
+        export_button = QPushButton("PDF保存")
+        export_button.clicked.connect(self.export_ledger_pdf)
+        controls.addWidget(export_button)
+        layout.addLayout(controls)
+        layout.addWidget(self.ledger_table)
+        return tab
+
+    def _trial_balance_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        controls = QHBoxLayout()
+        controls.addStretch()
+        export_button = QPushButton("PDF保存")
+        export_button.clicked.connect(self.export_trial_balance_pdf)
+        controls.addWidget(export_button)
+        layout.addLayout(controls)
+        layout.addWidget(self.trial_balance_table)
         return tab
 
     def _account_tab(self) -> QWidget:
@@ -871,6 +1163,34 @@ class KakeiboWindow(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
         table.itemSelectionChanged.connect(self.load_selected_account)
+        return table
+
+    def _ledger_table(self) -> QTableWidget:
+        table = QTableWidget(0, 8)
+        table.setHorizontalHeaderLabels(["ID", "日付", "種類", "内容", "メモ", "出金", "入金", "残高"])
+        table.setColumnHidden(0, True)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        return table
+
+    def _trial_balance_table(self) -> QTableWidget:
+        table = QTableWidget(0, 4)
+        table.setHorizontalHeaderLabels(["区分", "科目", "借方", "貸方"])
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
         return table
 
     def _memo_template_table(self) -> QTableWidget:
@@ -1063,17 +1383,161 @@ class KakeiboWindow(QMainWindow):
         self.store.delete_transaction(transaction_id)
         self.refresh()
 
+    def export_ledger_pdf(self) -> None:
+        account_name = self.ledger_account.currentText().strip() or "口座"
+        title = f"{self.selected_month_text()} 口座元帳 - {account_name}"
+        default_name = f"{self.selected_month.year}-{self.selected_month.month:02d}_ledger.pdf"
+        self._export_table_pdf(self.ledger_table, title, default_name)
+
+    def export_trial_balance_pdf(self) -> None:
+        title = f"{self.selected_month_text()} 試算表"
+        default_name = f"{self.selected_month.year}-{self.selected_month.month:02d}_trial_balance.pdf"
+        self._export_table_pdf(self.trial_balance_table, title, default_name)
+
+    def _export_table_pdf(self, table: QTableWidget, title: str, default_name: str) -> None:
+        path, _selected_filter = QFileDialog.getSaveFileName(
+            self,
+            "PDF保存",
+            str(APP_DIR / default_name),
+            "PDF Files (*.pdf)",
+        )
+        if not path:
+            return
+        output_path = Path(path)
+        if output_path.suffix.lower() != ".pdf":
+            output_path = output_path.with_suffix(".pdf")
+        self._write_table_pdf(output_path, title, table)
+        QMessageBox.information(self, "PDF保存", f"PDFを保存しました。\n{output_path}")
+
+    def _write_table_pdf(self, output_path: Path, title: str, table: QTableWidget) -> None:
+        printer = QPrinter(QPrinter.HighResolution)
+        printer.setOutputFormat(QPrinter.PdfFormat)
+        printer.setOutputFileName(str(output_path))
+
+        document = QTextDocument()
+        document.setDefaultFont(self.font())
+        document.setHtml(self._table_pdf_html(title, table))
+        document.print_(printer)
+
+    def _table_pdf_html(self, title: str, table: QTableWidget) -> str:
+        visible_columns = [
+            column
+            for column in range(table.columnCount())
+            if not table.isColumnHidden(column)
+        ]
+        headers = []
+        for column in visible_columns:
+            header_item = table.horizontalHeaderItem(column)
+            headers.append(escape(header_item.text() if header_item else ""))
+
+        body_rows = []
+        for row in range(table.rowCount()):
+            cells = []
+            for column in visible_columns:
+                item = table.item(row, column)
+                text = escape(item.text() if item else "")
+                align = "right" if text.startswith("¥") else "left"
+                cells.append(f'<td class="{align}">{text}</td>')
+            body_rows.append(f"<tr>{''.join(cells)}</tr>")
+
+        return f"""
+        <!doctype html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <style>
+                body {{
+                    font-family: "Yu Gothic UI", "Meiryo", sans-serif;
+                    color: #263238;
+                }}
+                h1 {{
+                    font-size: 18pt;
+                    margin-bottom: 14px;
+                }}
+                table {{
+                    border-collapse: collapse;
+                    width: 100%;
+                    font-size: 9pt;
+                }}
+                th {{
+                    background: #F0E8DE;
+                    font-weight: 700;
+                }}
+                th, td {{
+                    border: 1px solid #D6CDC2;
+                    padding: 5px 7px;
+                }}
+                td.right {{
+                    text-align: right;
+                    white-space: nowrap;
+                }}
+            </style>
+        </head>
+        <body>
+            <h1>{escape(title)}</h1>
+            <table>
+                <thead><tr>{''.join(f"<th>{header}</th>" for header in headers)}</tr></thead>
+                <tbody>{''.join(body_rows)}</tbody>
+            </table>
+        </body>
+        </html>
+        """
+
+    def selected_month_range(self) -> tuple[date, date]:
+        next_month = (
+            date(self.selected_month.year + 1, 1, 1)
+            if self.selected_month.month == 12
+            else date(self.selected_month.year, self.selected_month.month + 1, 1)
+        )
+        return self.selected_month, next_month
+
+    def selected_month_text(self) -> str:
+        return f"{self.selected_month.year}年{self.selected_month.month}月"
+
+    def show_previous_month(self) -> None:
+        self.selected_month = (
+            date(self.selected_month.year - 1, 12, 1)
+            if self.selected_month.month == 1
+            else date(self.selected_month.year, self.selected_month.month - 1, 1)
+        )
+        self.refresh()
+
+    def show_current_month(self) -> None:
+        self.selected_month = date.today().replace(day=1)
+        self.refresh()
+
+    def show_next_month(self) -> None:
+        self.selected_month = (
+            date(self.selected_month.year + 1, 1, 1)
+            if self.selected_month.month == 12
+            else date(self.selected_month.year, self.selected_month.month + 1, 1)
+        )
+        self.refresh()
+
     def refresh(self) -> None:
+        month_start, next_month_start = self.selected_month_range()
         self.accounts = self.store.list_accounts()
         self.managed_accounts = self.store.list_accounts(active_only=False)
-        self.transactions = self.store.list_transactions()
+        self.transactions = self.store.list_transactions(month_start, next_month_start)
         self._refresh_account_combos()
+        self._refresh_ledger_account_combo()
         self._refresh_memo_combos()
+        self._refresh_month_labels()
         self._render_transactions()
+        self._render_account_ledger()
+        self._render_trial_balance()
         self._render_accounts()
         self._render_memo_templates()
         self._render_account_panel()
         self._render_summary()
+
+    def _refresh_month_labels(self) -> None:
+        month_text = self.selected_month_text()
+        self.month_label.setText(month_text)
+        self.expense_card.set_title(f"{month_text}の支出")
+        self.income_card.set_title(f"{month_text}の収入")
+        self.history_label.setText(f"{month_text}の取引")
+        self.category_title.setText(f"{month_text}の支出内訳")
 
     def _refresh_account_combos(self) -> None:
         combos = [self.expense_account, self.income_account, self.transfer_from, self.transfer_to]
@@ -1092,6 +1556,19 @@ class KakeiboWindow(QMainWindow):
         if self.transfer_to.count() > 1 and self.transfer_to.currentIndex() == self.transfer_from.currentIndex():
             self.transfer_to.setCurrentIndex(1)
 
+    def _refresh_ledger_account_combo(self) -> None:
+        current_value = self.ledger_account.currentData()
+        self.ledger_account.blockSignals(True)
+        self.ledger_account.clear()
+        for account in self.managed_accounts:
+            status = "" if account.is_active else "（非表示）"
+            self.ledger_account.addItem(f"{account.name}{status}", account.id)
+        if current_value is not None:
+            index = self.ledger_account.findData(current_value)
+            if index >= 0:
+                self.ledger_account.setCurrentIndex(index)
+        self.ledger_account.blockSignals(False)
+
     def _refresh_memo_combos(self) -> None:
         combo_map = {
             self.expense_memo: "expense",
@@ -1108,16 +1585,13 @@ class KakeiboWindow(QMainWindow):
             combo.blockSignals(False)
 
     def _render_summary(self) -> None:
-        this_month = date.today().strftime("%Y-%m")
-        month_transactions = [tx for tx in self.transactions if tx.occurred_on.startswith(this_month)]
-        expense_total = sum(tx.amount for tx in month_transactions if tx.transaction_type == "expense")
-        income_total = sum(tx.amount for tx in month_transactions if tx.transaction_type == "income")
+        month_start, next_month_start = self.selected_month_range()
+        expense_total, income_total, by_category = self.store.monthly_totals(
+            month_start,
+            next_month_start,
+        )
         total_assets = sum(account.balance for account in self.accounts)
 
-        by_category = {category: 0 for category in EXPENSE_CATEGORIES}
-        for tx in month_transactions:
-            if tx.transaction_type == "expense":
-                by_category[tx.category] = by_category.get(tx.category, 0) + tx.amount
         self.assets_card.set_value(f"¥{total_assets:,}")
         self.expense_card.set_value(f"¥{expense_total:,}")
         self.income_card.set_value(f"¥{income_total:,}")
@@ -1142,6 +1616,70 @@ class KakeiboWindow(QMainWindow):
                 if column == 7:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.transaction_table.setItem(row, column, item)
+
+    def _render_account_ledger(self) -> None:
+        account_id = self.ledger_account.currentData()
+        if account_id is None:
+            self.ledger_table.setRowCount(0)
+            return
+
+        month_start, next_month_start = self.selected_month_range()
+        entries = self.store.account_ledger(account_id, month_start, next_month_start)
+        labels = {
+            "opening": "繰越",
+            "expense": "支出",
+            "income": "収入",
+            "transfer": "移動",
+        }
+        self.ledger_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            values = [
+                "" if entry.transaction_id is None else str(entry.transaction_id),
+                entry.occurred_on,
+                labels.get(entry.transaction_type, entry.transaction_type),
+                entry.description,
+                entry.memo,
+                "" if entry.withdrawal == 0 else f"¥{entry.withdrawal:,}",
+                "" if entry.deposit == 0 else f"¥{entry.deposit:,}",
+                f"¥{entry.balance:,}",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column in (5, 6, 7):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.ledger_table.setItem(row, column, item)
+
+    def _render_trial_balance(self) -> None:
+        month_start, next_month_start = self.selected_month_range()
+        rows = self.store.trial_balance(month_start, next_month_start)
+        debit_total = sum(row.debit for row in rows)
+        credit_total = sum(row.credit for row in rows)
+        display_rows = rows + [
+            TrialBalanceRow(
+                section="合計",
+                name="合計",
+                debit=debit_total,
+                credit=credit_total,
+            )
+        ]
+
+        self.trial_balance_table.setRowCount(len(display_rows))
+        for row_index, row in enumerate(display_rows):
+            values = [
+                row.section,
+                row.name,
+                "" if row.debit == 0 else f"¥{row.debit:,}",
+                "" if row.credit == 0 else f"¥{row.credit:,}",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column in (2, 3):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                if row.section == "合計":
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                self.trial_balance_table.setItem(row_index, column, item)
 
     def _render_accounts(self) -> None:
         current_id = self.selected_account_id()
@@ -1232,6 +1770,14 @@ class KakeiboWindow(QMainWindow):
                 color: #68717A;
                 background: transparent;
             }
+            #monthLabel {
+                font-size: 18px;
+                font-weight: 800;
+                color: #25324A;
+                background: transparent;
+                padding: 0 8px;
+                min-width: 112px;
+            }
             #cardValue {
                 font-size: 26px;
                 font-weight: 800;
@@ -1278,6 +1824,17 @@ class KakeiboWindow(QMainWindow):
             }
             QPushButton:hover {
                 background: #334465;
+            }
+            QSplitter#mainSplitter {
+                background: transparent;
+            }
+            QSplitter#mainSplitter::handle {
+                background: #DED6CC;
+                border-radius: 2px;
+                margin: 4px 6px;
+            }
+            QSplitter#mainSplitter::handle:hover {
+                background: #B9AFA3;
             }
             QScrollArea#categoryScroll, QScrollArea#accountScroll {
                 background: transparent;

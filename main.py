@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 import sys
-from html import escape
-from dataclasses import dataclass
 from datetime import date
+from html import escape
 from pathlib import Path
 
 from PySide6.QtCore import QDate, QRectF, QSize, Qt
@@ -36,665 +35,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from models import (
+    ACCOUNT_TYPES,
+    CATEGORY_COLORS,
+    CATEGORY_FALLBACK_COLORS,
+    CATEGORY_TYPES,
+    MEMO_USAGE_TYPES,
+    Account,
+    CategoryMaster,
+    Transaction,
+    TrialBalanceRow,
+)
+from store import KakeiboStore
+
 
 APP_DIR = Path(__file__).resolve().parent
 DB_PATH = APP_DIR / "kakeibo.db"
 ICON_PATH = APP_DIR / "assets" / "app_icon.svg"
-
-
-ACCOUNT_TYPES = {
-    "cash": "現金",
-    "bank": "普通預金",
-    "deposit": "定期預金等",
-    "pay": "Pay支払",
-    "credit_card": "クレジットカード",
-}
-
-
-EXPENSE_CATEGORIES = [
-    "食費",
-    "日用品",
-    "交通",
-    "住まい",
-    "水道光熱",
-    "通信",
-    "医療",
-    "保険",
-    "教育",
-    "美容",
-    "衣服",
-    "趣味",
-    "交際",
-    "税金",
-    "その他",
-]
-
-
-CATEGORY_COLORS = {
-    "食費": "#F28C8C",
-    "日用品": "#F2B36D",
-    "交通": "#7AA7E8",
-    "住まい": "#7EC8A4",
-    "水道光熱": "#F6C85F",
-    "通信": "#5FB3B3",
-    "医療": "#E87AA6",
-    "保険": "#7D8CC4",
-    "教育": "#B990E8",
-    "美容": "#F39BC3",
-    "衣服": "#C49A6C",
-    "趣味": "#9F86C0",
-    "交際": "#EF9F76",
-    "税金": "#8FA3AD",
-    "その他": "#9AA3AF",
-}
-
-
-MEMO_USAGE_TYPES = {
-    "common": "共通",
-    "expense": "支出",
-    "income": "収入",
-    "transfer": "資金移動",
-}
-
-
-@dataclass(frozen=True)
-class Account:
-    id: int
-    name: str
-    account_type: str
-    opening_balance: int
-    is_active: int
-    balance: int = 0
-
-    @property
-    def type_label(self) -> str:
-        return ACCOUNT_TYPES.get(self.account_type, self.account_type)
-
-
-@dataclass(frozen=True)
-class Transaction:
-    id: int
-    occurred_on: str
-    transaction_type: str
-    category: str
-    from_account_name: str
-    to_account_name: str
-    memo: str
-    amount: int
-
-
-@dataclass(frozen=True)
-class LedgerEntry:
-    transaction_id: int | None
-    occurred_on: str
-    transaction_type: str
-    description: str
-    memo: str
-    withdrawal: int
-    deposit: int
-    balance: int
-
-
-@dataclass(frozen=True)
-class TrialBalanceRow:
-    section: str
-    name: str
-    debit: int
-    credit: int
-
-
-@dataclass(frozen=True)
-class MemoTemplate:
-    id: int
-    memo: str
-    usage_type: str
-
-    @property
-    def usage_label(self) -> str:
-        return MEMO_USAGE_TYPES.get(self.usage_type, self.usage_type)
-
-
-class KakeiboStore:
-    def __init__(self, db_path: Path) -> None:
-        self.db_path = db_path
-        self._ensure_schema()
-        self._seed_accounts()
-        self._migrate_legacy_entries()
-
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        return conn
-
-    def _ensure_schema(self) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS accounts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT NOT NULL UNIQUE,
-                    account_type TEXT NOT NULL,
-                    opening_balance INTEGER NOT NULL DEFAULT 0,
-                    is_active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS transactions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    occurred_on TEXT NOT NULL,
-                    transaction_type TEXT NOT NULL CHECK(transaction_type IN ('expense', 'income', 'transfer')),
-                    category TEXT,
-                    from_account_id INTEGER,
-                    to_account_id INTEGER,
-                    memo TEXT NOT NULL,
-                    amount INTEGER NOT NULL CHECK(amount > 0),
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(from_account_id) REFERENCES accounts(id),
-                    FOREIGN KEY(to_account_id) REFERENCES accounts(id)
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS memo_templates (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    memo TEXT NOT NULL UNIQUE,
-                    usage_type TEXT NOT NULL DEFAULT 'common',
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-                )
-                """
-            )
-            columns = {
-                row["name"]
-                for row in conn.execute("PRAGMA table_info(memo_templates)").fetchall()
-            }
-            if "usage_type" not in columns:
-                conn.execute(
-                    "ALTER TABLE memo_templates ADD COLUMN usage_type TEXT NOT NULL DEFAULT 'common'"
-                )
-
-    def _seed_accounts(self) -> None:
-        with self._connect() as conn:
-            count = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
-            if count:
-                return
-            defaults = [
-                ("現金", "cash", 0),
-                ("普通預金1", "bank", 0),
-                ("普通預金2", "bank", 0),
-                ("定期預金等1", "deposit", 0),
-                ("Pay支払1", "pay", 0),
-            ]
-            conn.executemany(
-                "INSERT INTO accounts (name, account_type, opening_balance) VALUES (?, ?, ?)",
-                defaults,
-            )
-
-    def _migrate_legacy_entries(self) -> None:
-        with self._connect() as conn:
-            has_entries = conn.execute(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'entries'"
-            ).fetchone()[0]
-            tx_count = conn.execute("SELECT COUNT(*) FROM transactions").fetchone()[0]
-            if not has_entries or tx_count:
-                return
-
-            cash_id = self.get_or_create_account("現金", "cash")
-            legacy_rows = conn.execute(
-                "SELECT spent_on, category, memo, amount FROM entries ORDER BY id"
-            ).fetchall()
-            conn.executemany(
-                """
-                INSERT INTO transactions (
-                    occurred_on, transaction_type, category, from_account_id, to_account_id, memo, amount
-                )
-                VALUES (?, 'expense', ?, ?, NULL, ?, ?)
-                """,
-                [(row["spent_on"], row["category"], cash_id, row["memo"], row["amount"]) for row in legacy_rows],
-            )
-
-    def get_or_create_account(self, name: str, account_type: str) -> int:
-        with self._connect() as conn:
-            row = conn.execute("SELECT id FROM accounts WHERE name = ?", (name,)).fetchone()
-            if row:
-                return int(row["id"])
-            cur = conn.execute(
-                "INSERT INTO accounts (name, account_type, opening_balance) VALUES (?, ?, 0)",
-                (name, account_type),
-            )
-            return int(cur.lastrowid)
-
-    def add_account(self, name: str, account_type: str, opening_balance: int) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "INSERT INTO accounts (name, account_type, opening_balance) VALUES (?, ?, ?)",
-                (name, account_type, opening_balance),
-            )
-
-    def update_account(self, account_id: int, name: str, account_type: str, opening_balance: int) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE accounts
-                SET name = ?, account_type = ?, opening_balance = ?
-                WHERE id = ?
-                """,
-                (name, account_type, opening_balance, account_id),
-            )
-
-    def set_account_active(self, account_id: int, is_active: bool) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                "UPDATE accounts SET is_active = ? WHERE id = ?",
-                (1 if is_active else 0, account_id),
-            )
-
-    def account_transaction_count(self, account_id: int) -> int:
-        with self._connect() as conn:
-            return int(
-                conn.execute(
-                    """
-                    SELECT COUNT(*)
-                    FROM transactions
-                    WHERE from_account_id = ? OR to_account_id = ?
-                    """,
-                    (account_id, account_id),
-                ).fetchone()[0]
-            )
-
-    def delete_account(self, account_id: int) -> None:
-        if self.account_transaction_count(account_id) > 0:
-            raise ValueError("取引で使われている口座は削除できません。非表示にしてください。")
-        with self._connect() as conn:
-            conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
-
-    def list_accounts(self, active_only: bool = True) -> list[Account]:
-        where = "WHERE is_active = 1" if active_only else ""
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT id, name, account_type, opening_balance, is_active
-                FROM accounts
-                {where}
-                ORDER BY
-                    CASE account_type
-                        WHEN 'cash' THEN 0
-                        WHEN 'bank' THEN 1
-                        WHEN 'deposit' THEN 2
-                        WHEN 'pay' THEN 3
-                        WHEN 'credit_card' THEN 4
-                        ELSE 5
-                    END,
-                    id
-                """
-            ).fetchall()
-        balances = self.account_balances()
-        return [
-            Account(
-                id=row["id"],
-                name=row["name"],
-                account_type=row["account_type"],
-                opening_balance=row["opening_balance"],
-                is_active=row["is_active"],
-                balance=balances.get(row["id"], row["opening_balance"]),
-            )
-            for row in rows
-        ]
-
-    def account_balances(self) -> dict[int, int]:
-        with self._connect() as conn:
-            accounts = conn.execute("SELECT id, opening_balance FROM accounts").fetchall()
-            balances = {row["id"]: int(row["opening_balance"]) for row in accounts}
-            rows = conn.execute(
-                "SELECT transaction_type, from_account_id, to_account_id, amount FROM transactions"
-            ).fetchall()
-
-        for row in rows:
-            amount = int(row["amount"])
-            tx_type = row["transaction_type"]
-            from_id = row["from_account_id"]
-            to_id = row["to_account_id"]
-            if tx_type == "expense" and from_id:
-                balances[from_id] = balances.get(from_id, 0) - amount
-            elif tx_type == "income" and to_id:
-                balances[to_id] = balances.get(to_id, 0) + amount
-            elif tx_type == "transfer":
-                if from_id:
-                    balances[from_id] = balances.get(from_id, 0) - amount
-                if to_id:
-                    balances[to_id] = balances.get(to_id, 0) + amount
-        return balances
-
-    def account_balance_before(self, account_id: int, before_date: date) -> int:
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT opening_balance FROM accounts WHERE id = ?",
-                (account_id,),
-            ).fetchone()
-            if row is None:
-                return 0
-            balance = int(row["opening_balance"])
-            rows = conn.execute(
-                """
-                SELECT transaction_type, from_account_id, to_account_id, amount
-                FROM transactions
-                WHERE occurred_on < ?
-                  AND (from_account_id = ? OR to_account_id = ?)
-                ORDER BY occurred_on, id
-                """,
-                (before_date.isoformat(), account_id, account_id),
-            ).fetchall()
-
-        for row in rows:
-            amount = int(row["amount"])
-            if row["transaction_type"] == "expense" and row["from_account_id"] == account_id:
-                balance -= amount
-            elif row["transaction_type"] == "income" and row["to_account_id"] == account_id:
-                balance += amount
-            elif row["transaction_type"] == "transfer":
-                if row["from_account_id"] == account_id:
-                    balance -= amount
-                elif row["to_account_id"] == account_id:
-                    balance += amount
-        return balance
-
-    def account_ledger(self, account_id: int, month_start: date, next_month_start: date) -> list[LedgerEntry]:
-        balance = self.account_balance_before(account_id, month_start)
-        entries = [
-            LedgerEntry(
-                transaction_id=None,
-                occurred_on=month_start.isoformat(),
-                transaction_type="opening",
-                description="前月繰越",
-                memo="",
-                withdrawal=0,
-                deposit=0,
-                balance=balance,
-            )
-        ]
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT
-                    t.id,
-                    t.occurred_on,
-                    t.transaction_type,
-                    COALESCE(t.category, '') AS category,
-                    t.from_account_id,
-                    t.to_account_id,
-                    COALESCE(f.name, '') AS from_account_name,
-                    COALESCE(ta.name, '') AS to_account_name,
-                    t.memo,
-                    t.amount
-                FROM transactions t
-                LEFT JOIN accounts f ON f.id = t.from_account_id
-                LEFT JOIN accounts ta ON ta.id = t.to_account_id
-                WHERE t.occurred_on >= ?
-                  AND t.occurred_on < ?
-                  AND (t.from_account_id = ? OR t.to_account_id = ?)
-                ORDER BY t.occurred_on, t.id
-                """,
-                (
-                    month_start.isoformat(),
-                    next_month_start.isoformat(),
-                    account_id,
-                    account_id,
-                ),
-            ).fetchall()
-
-        for row in rows:
-            amount = int(row["amount"])
-            withdrawal = 0
-            deposit = 0
-            tx_type = row["transaction_type"]
-            if tx_type == "expense":
-                withdrawal = amount
-                description = row["category"] or "支出"
-            elif tx_type == "income":
-                deposit = amount
-                description = row["category"] or "収入"
-            elif row["from_account_id"] == account_id:
-                withdrawal = amount
-                description = f"振替 → {row['to_account_name']}"
-            else:
-                deposit = amount
-                description = f"振替 ← {row['from_account_name']}"
-
-            balance += deposit - withdrawal
-            entries.append(
-                LedgerEntry(
-                    transaction_id=int(row["id"]),
-                    occurred_on=row["occurred_on"],
-                    transaction_type=tx_type,
-                    description=description,
-                    memo=row["memo"],
-                    withdrawal=withdrawal,
-                    deposit=deposit,
-                    balance=balance,
-                )
-            )
-        return entries
-
-    def add_expense(self, occurred_on: str, account_id: int, category: str, memo: str, amount: int) -> None:
-        self._add_transaction(occurred_on, "expense", category, account_id, None, memo, amount)
-
-    def add_income(self, occurred_on: str, account_id: int, category: str, memo: str, amount: int) -> None:
-        self._add_transaction(occurred_on, "income", category, None, account_id, memo, amount)
-
-    def add_transfer(self, occurred_on: str, from_account_id: int, to_account_id: int, memo: str, amount: int) -> None:
-        if from_account_id == to_account_id:
-            raise ValueError("移動元と移動先は別の口座を選んでください。")
-        self._add_transaction(occurred_on, "transfer", "資金移動", from_account_id, to_account_id, memo, amount)
-
-    def _add_transaction(
-        self,
-        occurred_on: str,
-        transaction_type: str,
-        category: str,
-        from_account_id: int | None,
-        to_account_id: int | None,
-        memo: str,
-        amount: int,
-    ) -> None:
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO transactions (
-                    occurred_on, transaction_type, category, from_account_id, to_account_id, memo, amount
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                (occurred_on, transaction_type, category, from_account_id, to_account_id, memo, amount),
-            )
-
-    def delete_transaction(self, transaction_id: int) -> None:
-        with self._connect() as conn:
-            conn.execute("DELETE FROM transactions WHERE id = ?", (transaction_id,))
-
-    def add_memo_template(self, memo: str, usage_type: str = "common") -> bool:
-        text = memo.strip()
-        if not text:
-            raise ValueError("保存する摘要を入力してください。")
-        if usage_type not in MEMO_USAGE_TYPES:
-            raise ValueError("摘要の用途が不正です。")
-        with self._connect() as conn:
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO memo_templates (memo, usage_type) VALUES (?, ?)",
-                (text, usage_type),
-            )
-            return cur.rowcount > 0
-
-    def delete_memo_template(self, template_id: int) -> None:
-        with self._connect() as conn:
-            conn.execute("DELETE FROM memo_templates WHERE id = ?", (template_id,))
-
-    def list_memo_template_records(self) -> list[MemoTemplate]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT id, memo, usage_type
-                FROM memo_templates
-                ORDER BY
-                    CASE usage_type
-                        WHEN 'common' THEN 0
-                        WHEN 'expense' THEN 1
-                        WHEN 'income' THEN 2
-                        WHEN 'transfer' THEN 3
-                        ELSE 4
-                    END,
-                    memo
-                """
-            ).fetchall()
-        return [
-            MemoTemplate(id=row["id"], memo=row["memo"], usage_type=row["usage_type"])
-            for row in rows
-        ]
-
-    def list_memo_templates(self, usage_type: str) -> list[str]:
-        return [
-            template.memo
-            for template in self.list_memo_template_records()
-            if template.usage_type in ("common", usage_type)
-        ]
-
-    def list_transactions(
-        self,
-        month_start: date | None = None,
-        next_month_start: date | None = None,
-    ) -> list[Transaction]:
-        where = ""
-        params: tuple[str, ...] = ()
-        if month_start is not None and next_month_start is not None:
-            where = "WHERE t.occurred_on >= ? AND t.occurred_on < ?"
-            params = (month_start.isoformat(), next_month_start.isoformat())
-        with self._connect() as conn:
-            rows = conn.execute(
-                f"""
-                SELECT
-                    t.id,
-                    t.occurred_on,
-                    t.transaction_type,
-                    COALESCE(t.category, '') AS category,
-                    COALESCE(f.name, '') AS from_account_name,
-                    COALESCE(ta.name, '') AS to_account_name,
-                    t.memo,
-                    t.amount
-                FROM transactions t
-                LEFT JOIN accounts f ON f.id = t.from_account_id
-                LEFT JOIN accounts ta ON ta.id = t.to_account_id
-                {where}
-                ORDER BY t.occurred_on DESC, t.id DESC
-                """,
-                params,
-            ).fetchall()
-        return [Transaction(**dict(row)) for row in rows]
-
-    def monthly_totals(self, month_start: date, next_month_start: date) -> tuple[int, int, dict[str, int]]:
-        with self._connect() as conn:
-            rows = conn.execute(
-                """
-                SELECT transaction_type, COALESCE(category, '') AS category, SUM(amount) AS total
-                FROM transactions
-                WHERE occurred_on >= ? AND occurred_on < ?
-                GROUP BY transaction_type, COALESCE(category, '')
-                """,
-                (month_start.isoformat(), next_month_start.isoformat()),
-            ).fetchall()
-
-        expense_total = 0
-        income_total = 0
-        by_category: dict[str, int] = {}
-        for row in rows:
-            total = int(row["total"] or 0)
-            if row["transaction_type"] == "expense":
-                expense_total += total
-                by_category[row["category"]] = by_category.get(row["category"], 0) + total
-            elif row["transaction_type"] == "income":
-                income_total += total
-        return expense_total, income_total, by_category
-
-    def trial_balance(self, month_start: date, next_month_start: date) -> list[TrialBalanceRow]:
-        rows: list[TrialBalanceRow] = []
-        opening_net_assets = 0
-        for account in self.list_accounts(active_only=False):
-            opening_net_assets += self.account_balance_before(account.id, month_start)
-            ending_balance = self.account_balance_before(account.id, next_month_start)
-            if account.account_type == "credit_card" and ending_balance < 0:
-                rows.append(
-                    TrialBalanceRow(
-                        section="負債",
-                        name=account.name,
-                        debit=0,
-                        credit=-ending_balance,
-                    )
-                )
-            elif ending_balance != 0:
-                rows.append(
-                    TrialBalanceRow(
-                        section="資産",
-                        name=account.name,
-                        debit=max(ending_balance, 0),
-                        credit=max(-ending_balance, 0),
-                    )
-                )
-
-        if opening_net_assets > 0:
-            rows.append(
-                TrialBalanceRow(
-                    section="純資産",
-                    name="期首純資産",
-                    debit=0,
-                    credit=opening_net_assets,
-                )
-            )
-        elif opening_net_assets < 0:
-            rows.append(
-                TrialBalanceRow(
-                    section="純資産",
-                    name="期首純資産",
-                    debit=-opening_net_assets,
-                    credit=0,
-                )
-            )
-
-        with self._connect() as conn:
-            category_rows = conn.execute(
-                """
-                SELECT transaction_type, COALESCE(category, '') AS category, SUM(amount) AS total
-                FROM transactions
-                WHERE occurred_on >= ? AND occurred_on < ?
-                  AND transaction_type IN ('expense', 'income')
-                GROUP BY transaction_type, COALESCE(category, '')
-                ORDER BY transaction_type, category
-                """,
-                (month_start.isoformat(), next_month_start.isoformat()),
-            ).fetchall()
-
-        for row in category_rows:
-            amount = int(row["total"] or 0)
-            category = row["category"] or "未分類"
-            if row["transaction_type"] == "expense":
-                rows.append(
-                    TrialBalanceRow(
-                        section="費用",
-                        name=category,
-                        debit=amount,
-                        credit=0,
-                    )
-                )
-            elif row["transaction_type"] == "income":
-                rows.append(
-                    TrialBalanceRow(
-                        section="収益",
-                        name=category,
-                        debit=0,
-                        credit=amount,
-                    )
-                )
-        return rows
 
 
 class SummaryCard(QFrame):
@@ -794,7 +151,6 @@ class ToggleSwitch(QCheckBox):
             painter.drawLine(x, 18, x + 10, 18)
             painter.drawLine(x, 24, x + 8, 24)
 
-
 class KakeiboWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -802,6 +158,11 @@ class KakeiboWindow(QMainWindow):
         self.accounts: list[Account] = []
         self.managed_accounts: list[Account] = []
         self.transactions: list[Transaction] = []
+        self.expense_categories: list[str] = []
+        self.income_categories: list[str] = []
+        self.category_records: list[CategoryMaster] = []
+        self.editing_transaction_id: int | None = None
+        self.editing_transaction_type: str | None = None
         self.selected_month = date.today().replace(day=1)
 
         self.setWindowTitle("My家計簿")
@@ -820,6 +181,15 @@ class KakeiboWindow(QMainWindow):
         self.ledger_account = QComboBox()
         self.ledger_account.currentIndexChanged.connect(lambda _index: self._render_account_ledger())
         self.ledger_table = self._ledger_table()
+        self.category_ledger_type = QComboBox()
+        for key, label in CATEGORY_TYPES.items():
+            self.category_ledger_type.addItem(label, key)
+        self.category_ledger_type.currentIndexChanged.connect(
+            lambda _index: self._refresh_category_ledger_category_combo()
+        )
+        self.category_ledger_category = QComboBox()
+        self.category_ledger_category.currentIndexChanged.connect(lambda _index: self._render_category_ledger())
+        self.category_ledger_table = self._category_ledger_table()
         self.trial_balance_table = self._trial_balance_table()
 
         self.account_container = QWidget()
@@ -848,14 +218,12 @@ class KakeiboWindow(QMainWindow):
         self.expense_date = self._date_input()
         self.expense_account = QComboBox()
         self.expense_category = QComboBox()
-        self.expense_category.addItems(EXPENSE_CATEGORIES)
         self.expense_memo = self._memo_input("例: スーパー、電車、コーヒー")
         self.expense_amount = self._amount_input()
 
         self.income_date = self._date_input()
         self.income_account = QComboBox()
         self.income_category = QComboBox()
-        self.income_category.addItems(["給与", "賞与", "利息", "臨時収入", "その他"])
         self.income_memo = self._memo_input("例: 給与、利息")
         self.income_amount = self._amount_input()
 
@@ -872,13 +240,23 @@ class KakeiboWindow(QMainWindow):
         self.account_name.setPlaceholderText("例: 普通預金3、Pay支払2、クレジットカード")
         self.account_opening = self._balance_input()
 
+        self.category_type = QComboBox()
+        for key, label in CATEGORY_TYPES.items():
+            self.category_type.addItem(label, key)
+        self.category_name = QLineEdit()
+        self.category_name.setPlaceholderText("例: 食費、給与、雑収入")
+
         self.memo_template_input = QLineEdit()
         self.memo_template_input.setPlaceholderText("例: スーパー、家賃、カード引落")
         self.memo_template_usage = QComboBox()
         for key, label in MEMO_USAGE_TYPES.items():
             self.memo_template_usage.addItem(label, key)
         self.transaction_table = self._transaction_table()
+        self.transaction_table.cellDoubleClicked.connect(
+            lambda _row, _column: self.load_selected_transaction_for_edit()
+        )
         self.account_table = self._account_table()
+        self.category_table = self._category_table()
         self.memo_template_table = self._memo_template_table()
 
         self.setCentralWidget(self._build_ui())
@@ -931,9 +309,9 @@ class KakeiboWindow(QMainWindow):
         current_month_button.clicked.connect(self.show_current_month)
         next_month_button = QPushButton("翌月")
         next_month_button.clicked.connect(self.show_next_month)
+        hero.addWidget(current_month_button)
         hero.addWidget(previous_month_button)
         hero.addWidget(self.month_label)
-        hero.addWidget(current_month_button)
         hero.addWidget(next_month_button)
         layout.addLayout(hero)
 
@@ -962,24 +340,43 @@ class KakeiboWindow(QMainWindow):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
 
-        tabs = QTabWidget()
-        tabs.addTab(self._expense_tab(), "支出")
-        tabs.addTab(self._income_tab(), "収入")
-        tabs.addTab(self._transfer_tab(), "資金移動")
-        tabs.addTab(self._ledger_tab(), "口座元帳")
-        tabs.addTab(self._trial_balance_tab(), "試算表")
-        tabs.addTab(self._account_tab(), "口座管理")
-        tabs.addTab(self._memo_dictionary_tab(), "摘要辞書")
+        self.transaction_tabs = QTabWidget()
+        self.transaction_tabs.addTab(self._expense_tab(), "支出")
+        self.transaction_tabs.addTab(self._income_tab(), "収入")
+        self.transaction_tabs.addTab(self._transfer_tab(), "資金移動")
+        self.transaction_tabs.addTab(self._ledger_tab(), "口座元帳")
+        self.transaction_tabs.addTab(self._category_ledger_tab(), "カテゴリ元帳")
+        self.transaction_tabs.addTab(self._trial_balance_tab(), "試算表")
+        self.transaction_tabs.addTab(self._account_tab(), "口座管理")
+        self.transaction_tabs.addTab(self._category_tab(), "カテゴリ管理")
+        self.transaction_tabs.addTab(self._memo_dictionary_tab(), "摘要辞書")
 
-        layout.addWidget(tabs)
+        history_panel = QWidget()
+        history_layout = QVBoxLayout(history_panel)
+        history_layout.setContentsMargins(0, 0, 0, 0)
+        history_layout.setSpacing(10)
         history_header = QHBoxLayout()
+        edit_button = QPushButton("選択取引を編集")
+        edit_button.clicked.connect(self.load_selected_transaction_for_edit)
         delete_button = QPushButton("選択行を削除")
+        delete_button.setObjectName("deleteButton")
         delete_button.clicked.connect(self.delete_selected_transaction)
         history_header.addWidget(self.history_label)
         history_header.addStretch()
+        history_header.addWidget(edit_button)
         history_header.addWidget(delete_button)
-        layout.addLayout(history_header)
-        layout.addWidget(self.transaction_table, 1)
+        history_layout.addLayout(history_header)
+        history_layout.addWidget(self.transaction_table)
+
+        left_splitter = QSplitter(Qt.Vertical)
+        left_splitter.setObjectName("leftSplitter")
+        left_splitter.setChildrenCollapsible(False)
+        left_splitter.addWidget(self.transaction_tabs)
+        left_splitter.addWidget(history_panel)
+        left_splitter.setStretchFactor(0, 1)
+        left_splitter.setStretchFactor(1, 2)
+        left_splitter.setSizes([260, 420])
+        layout.addWidget(left_splitter, 1)
         return panel
 
     def _build_right_panel(self) -> QWidget:
@@ -1014,8 +411,12 @@ class KakeiboWindow(QMainWindow):
         layout = QGridLayout(tab)
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(10)
-        add_button = QPushButton("＋ 支出を追加")
-        add_button.clicked.connect(self.add_expense)
+        self.expense_add_button = QPushButton("＋ 支出を追加")
+        self.expense_add_button.clicked.connect(self.add_expense)
+        self.expense_update_button = QPushButton("更新の確定")
+        self.expense_update_button.clicked.connect(self.update_editing_transaction)
+        self.expense_cancel_edit_button = QPushButton("編集取りやめ")
+        self.expense_cancel_edit_button.clicked.connect(self.cancel_transaction_edit)
         save_memo_button = QPushButton("辞書へ保存")
         save_memo_button.clicked.connect(lambda: self.save_memo_template(self.expense_memo, "expense"))
 
@@ -1030,7 +431,9 @@ class KakeiboWindow(QMainWindow):
         layout.addWidget(save_memo_button, 1, 4)
         layout.addWidget(QLabel("金額"), 2, 0)
         layout.addWidget(self.expense_amount, 2, 1)
-        layout.addWidget(add_button, 2, 3)
+        layout.addWidget(self.expense_add_button, 2, 3)
+        layout.addWidget(self.expense_update_button, 2, 4)
+        layout.addWidget(self.expense_cancel_edit_button, 2, 5)
         return tab
 
     def _income_tab(self) -> QWidget:
@@ -1038,8 +441,12 @@ class KakeiboWindow(QMainWindow):
         layout = QGridLayout(tab)
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(10)
-        add_button = QPushButton("＋ 収入を追加")
-        add_button.clicked.connect(self.add_income)
+        self.income_add_button = QPushButton("＋ 収入を追加")
+        self.income_add_button.clicked.connect(self.add_income)
+        self.income_update_button = QPushButton("更新の確定")
+        self.income_update_button.clicked.connect(self.update_editing_transaction)
+        self.income_cancel_edit_button = QPushButton("編集取りやめ")
+        self.income_cancel_edit_button.clicked.connect(self.cancel_transaction_edit)
         save_memo_button = QPushButton("辞書へ保存")
         save_memo_button.clicked.connect(lambda: self.save_memo_template(self.income_memo, "income"))
 
@@ -1054,7 +461,9 @@ class KakeiboWindow(QMainWindow):
         layout.addWidget(save_memo_button, 1, 4)
         layout.addWidget(QLabel("金額"), 2, 0)
         layout.addWidget(self.income_amount, 2, 1)
-        layout.addWidget(add_button, 2, 3)
+        layout.addWidget(self.income_add_button, 2, 3)
+        layout.addWidget(self.income_update_button, 2, 4)
+        layout.addWidget(self.income_cancel_edit_button, 2, 5)
         return tab
 
     def _transfer_tab(self) -> QWidget:
@@ -1062,8 +471,12 @@ class KakeiboWindow(QMainWindow):
         layout = QGridLayout(tab)
         layout.setHorizontalSpacing(10)
         layout.setVerticalSpacing(10)
-        add_button = QPushButton("⇄ 移動を記録")
-        add_button.clicked.connect(self.add_transfer)
+        self.transfer_add_button = QPushButton("⇄ 移動を記録")
+        self.transfer_add_button.clicked.connect(self.add_transfer)
+        self.transfer_update_button = QPushButton("更新の確定")
+        self.transfer_update_button.clicked.connect(self.update_editing_transaction)
+        self.transfer_cancel_edit_button = QPushButton("編集取りやめ")
+        self.transfer_cancel_edit_button.clicked.connect(self.cancel_transaction_edit)
         save_memo_button = QPushButton("辞書へ保存")
         save_memo_button.clicked.connect(lambda: self.save_memo_template(self.transfer_memo, "transfer"))
 
@@ -1078,7 +491,9 @@ class KakeiboWindow(QMainWindow):
         layout.addWidget(save_memo_button, 1, 4)
         layout.addWidget(QLabel("金額"), 2, 0)
         layout.addWidget(self.transfer_amount, 2, 1)
-        layout.addWidget(add_button, 2, 3)
+        layout.addWidget(self.transfer_add_button, 2, 3)
+        layout.addWidget(self.transfer_update_button, 2, 4)
+        layout.addWidget(self.transfer_cancel_edit_button, 2, 5)
         return tab
 
     def _ledger_tab(self) -> QWidget:
@@ -1093,6 +508,22 @@ class KakeiboWindow(QMainWindow):
         controls.addWidget(export_button)
         layout.addLayout(controls)
         layout.addWidget(self.ledger_table)
+        return tab
+
+    def _category_ledger_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("種別"))
+        controls.addWidget(self.category_ledger_type)
+        controls.addWidget(QLabel("カテゴリ"))
+        controls.addWidget(self.category_ledger_category)
+        controls.addStretch()
+        export_button = QPushButton("PDF保存")
+        export_button.clicked.connect(self.export_category_ledger_pdf)
+        controls.addWidget(export_button)
+        layout.addLayout(controls)
+        layout.addWidget(self.category_ledger_table)
         return tab
 
     def _trial_balance_tab(self) -> QWidget:
@@ -1118,6 +549,7 @@ class KakeiboWindow(QMainWindow):
         visibility_button = QPushButton("表示/非表示")
         visibility_button.clicked.connect(self.toggle_selected_account_visibility)
         delete_button = QPushButton("未使用口座を削除")
+        delete_button.setObjectName("deleteButton")
         delete_button.clicked.connect(self.delete_selected_account)
         form.addWidget(QLabel("種別"), 0, 0)
         form.addWidget(self.account_type, 0, 1)
@@ -1133,6 +565,25 @@ class KakeiboWindow(QMainWindow):
         layout.addWidget(self.account_table)
         return tab
 
+    def _category_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        form = QGridLayout()
+        add_button = QPushButton("＋ カテゴリを追加")
+        add_button.clicked.connect(self.add_category_from_master)
+        update_button = QPushButton("選択カテゴリを更新")
+        update_button.clicked.connect(self.update_selected_category)
+
+        form.addWidget(QLabel("種別"), 0, 0)
+        form.addWidget(self.category_type, 0, 1)
+        form.addWidget(QLabel("カテゴリ名"), 0, 2)
+        form.addWidget(self.category_name, 0, 3)
+        form.addWidget(add_button, 0, 4)
+        form.addWidget(update_button, 0, 5)
+        layout.addLayout(form)
+        layout.addWidget(self.category_table)
+        return tab
+
     def _memo_dictionary_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -1140,6 +591,7 @@ class KakeiboWindow(QMainWindow):
         add_button = QPushButton("＋ 摘要を登録")
         add_button.clicked.connect(self.add_memo_template_from_master)
         delete_button = QPushButton("選択行を削除")
+        delete_button.setObjectName("deleteButton")
         delete_button.clicked.connect(self.delete_selected_memo_template)
 
         form.addWidget(QLabel("摘要"), 0, 0)
@@ -1199,6 +651,22 @@ class KakeiboWindow(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
         return table
 
+    def _category_ledger_table(self) -> QTableWidget:
+        table = QTableWidget(0, 8)
+        table.setHorizontalHeaderLabels(["ID", "日付", "種類", "カテゴリ", "口座", "メモ", "金額", "累計"])
+        table.setColumnHidden(0, True)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(5, QHeaderView.Stretch)
+        table.horizontalHeader().setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(7, QHeaderView.ResizeToContents)
+        return table
+
     def _trial_balance_table(self) -> QTableWidget:
         table = QTableWidget(0, 4)
         table.setHorizontalHeaderLabels(["区分", "科目", "借方", "貸方"])
@@ -1209,6 +677,18 @@ class KakeiboWindow(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
         table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeToContents)
+        return table
+
+    def _category_table(self) -> QTableWidget:
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels(["ID", "種別", "カテゴリ名"])
+        table.setColumnHidden(0, True)
+        table.setSelectionBehavior(QTableWidget.SelectRows)
+        table.setEditTriggers(QTableWidget.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
+        table.itemSelectionChanged.connect(self.load_selected_category)
         return table
 
     def _memo_template_table(self) -> QTableWidget:
@@ -1222,7 +702,34 @@ class KakeiboWindow(QMainWindow):
         table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         return table
 
+    def confirm_registration_date(self, target_date: QDate) -> bool:
+        today = QDate.currentDate()
+        target_days = target_date.toJulianDay()
+        future_days = today.addMonths(1).toJulianDay()
+        past_days = today.addMonths(-6).toJulianDay()
+        if target_days < future_days and target_days > past_days:
+            return True
+
+        direction = "未来" if target_days >= future_days else "過去"
+        reply = QMessageBox.question(
+            self,
+            "日付確認",
+            (
+                f"登録日が本日から{direction}に大きく離れています。\n\n"
+                f"登録日: {target_date.toString('yyyy年M月d日')}\n"
+                "この日付で登録してよろしいですか？"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return reply == QMessageBox.Yes
+
     def add_expense(self) -> None:
+        if self.editing_transaction_id is not None:
+            QMessageBox.information(self, "取引編集", "編集中は新規追加できません。")
+            return
+        if not self.confirm_registration_date(self.expense_date.date()):
+            return
         self.store.add_expense(
             self.expense_date.date().toString("yyyy-MM-dd"),
             self.expense_account.currentData(),
@@ -1235,6 +742,11 @@ class KakeiboWindow(QMainWindow):
         self.refresh()
 
     def add_income(self) -> None:
+        if self.editing_transaction_id is not None:
+            QMessageBox.information(self, "取引編集", "編集中は新規追加できません。")
+            return
+        if not self.confirm_registration_date(self.income_date.date()):
+            return
         self.store.add_income(
             self.income_date.date().toString("yyyy-MM-dd"),
             self.income_account.currentData(),
@@ -1247,6 +759,11 @@ class KakeiboWindow(QMainWindow):
         self.refresh()
 
     def add_transfer(self) -> None:
+        if self.editing_transaction_id is not None:
+            QMessageBox.information(self, "取引編集", "編集中は新規追加できません。")
+            return
+        if not self.confirm_registration_date(self.transfer_date.date()):
+            return
         try:
             self.store.add_transfer(
                 self.transfer_date.date().toString("yyyy-MM-dd"),
@@ -1260,6 +777,153 @@ class KakeiboWindow(QMainWindow):
             return
         self.transfer_memo.clearEditText()
         self.transfer_amount.setValue(1)
+        self.refresh()
+
+    def _sync_transaction_edit_controls(self) -> None:
+        editing_type = self.editing_transaction_type
+        is_editing = editing_type is not None
+
+        for button in (self.expense_add_button, self.income_add_button, self.transfer_add_button):
+            button.setEnabled(not is_editing)
+
+        edit_controls = {
+            "expense": (self.expense_update_button, self.expense_cancel_edit_button),
+            "income": (self.income_update_button, self.income_cancel_edit_button),
+            "transfer": (self.transfer_update_button, self.transfer_cancel_edit_button),
+        }
+        for transaction_type, buttons in edit_controls.items():
+            enabled = editing_type == transaction_type
+            for button in buttons:
+                button.setEnabled(enabled)
+
+    def cancel_transaction_edit(self) -> None:
+        self.editing_transaction_id = None
+        self.editing_transaction_type = None
+        self._sync_transaction_edit_controls()
+
+    def selected_transaction_id(self) -> int | None:
+        row = self.transaction_table.currentRow()
+        if row < 0:
+            return None
+        item = self.transaction_table.item(row, 0)
+        return int(item.text()) if item else None
+
+    def selected_transaction(self) -> Transaction | None:
+        transaction_id = self.selected_transaction_id()
+        if transaction_id is None:
+            return None
+        return next(
+            (transaction for transaction in self.transactions if transaction.id == transaction_id),
+            None,
+        )
+
+    def _set_combo_data(self, combo: QComboBox, data: int | None) -> None:
+        if data is None:
+            return
+        index = combo.findData(data)
+        if index < 0:
+            account = next((account for account in self.managed_accounts if account.id == data), None)
+            if account is not None:
+                status = "" if account.is_active else "（非表示）"
+                combo.addItem(f"{account.name}{status}（¥{account.balance:,}）", account.id)
+                index = combo.findData(data)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def _set_combo_text(self, combo: QComboBox, text: str) -> None:
+        index = combo.findText(text)
+        if index < 0 and text:
+            combo.addItem(text)
+            index = combo.findText(text)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+
+    def load_selected_transaction_for_edit(self) -> None:
+        tx = self.selected_transaction()
+        if tx is None:
+            QMessageBox.information(self, "取引編集", "編集する取引を選択してください。")
+            return
+
+        self.editing_transaction_id = tx.id
+        self.editing_transaction_type = tx.transaction_type
+        tx_date = QDate.fromString(tx.occurred_on, "yyyy-MM-dd")
+        if not tx_date.isValid():
+            tx_date = QDate.currentDate()
+
+        if tx.transaction_type == "expense":
+            self.transaction_tabs.setCurrentIndex(0)
+            self.expense_date.setDate(tx_date)
+            self._set_combo_data(self.expense_account, tx.from_account_id)
+            self._set_combo_text(self.expense_category, tx.category)
+            self.expense_memo.setEditText(tx.memo)
+            self.expense_amount.setValue(tx.amount)
+        elif tx.transaction_type == "income":
+            self.transaction_tabs.setCurrentIndex(1)
+            self.income_date.setDate(tx_date)
+            self._set_combo_data(self.income_account, tx.to_account_id)
+            self._set_combo_text(self.income_category, tx.category)
+            self.income_memo.setEditText(tx.memo)
+            self.income_amount.setValue(tx.amount)
+        elif tx.transaction_type == "transfer":
+            self.transaction_tabs.setCurrentIndex(2)
+            self.transfer_date.setDate(tx_date)
+            self._set_combo_data(self.transfer_from, tx.from_account_id)
+            self._set_combo_data(self.transfer_to, tx.to_account_id)
+            self.transfer_memo.setEditText(tx.memo)
+            self.transfer_amount.setValue(tx.amount)
+        self._sync_transaction_edit_controls()
+
+    def update_editing_transaction(self) -> None:
+        if self.editing_transaction_id is None or self.editing_transaction_type is None:
+            QMessageBox.information(self, "取引編集", "先に編集する取引を選択してください。")
+            return
+
+        try:
+            if self.editing_transaction_type == "expense":
+                self.store.update_transaction(
+                    self.editing_transaction_id,
+                    self.expense_date.date().toString("yyyy-MM-dd"),
+                    "expense",
+                    self.expense_category.currentText(),
+                    self.expense_account.currentData(),
+                    None,
+                    self.expense_memo.currentText().strip() or "メモなし",
+                    self.expense_amount.value(),
+                )
+                self.expense_memo.clearEditText()
+                self.expense_amount.setValue(1)
+            elif self.editing_transaction_type == "income":
+                self.store.update_transaction(
+                    self.editing_transaction_id,
+                    self.income_date.date().toString("yyyy-MM-dd"),
+                    "income",
+                    self.income_category.currentText(),
+                    None,
+                    self.income_account.currentData(),
+                    self.income_memo.currentText().strip() or "メモなし",
+                    self.income_amount.value(),
+                )
+                self.income_memo.clearEditText()
+                self.income_amount.setValue(1)
+            elif self.editing_transaction_type == "transfer":
+                self.store.update_transaction(
+                    self.editing_transaction_id,
+                    self.transfer_date.date().toString("yyyy-MM-dd"),
+                    "transfer",
+                    "資金移動",
+                    self.transfer_from.currentData(),
+                    self.transfer_to.currentData(),
+                    self.transfer_memo.currentText().strip() or "資金移動",
+                    self.transfer_amount.value(),
+                )
+                self.transfer_memo.clearEditText()
+                self.transfer_amount.setValue(1)
+        except ValueError as exc:
+            QMessageBox.information(self, "取引編集", str(exc))
+            return
+
+        self.editing_transaction_id = None
+        self.editing_transaction_type = None
         self.refresh()
 
     def save_memo_template(self, memo_input: QComboBox, usage_type: str) -> None:
@@ -1297,6 +961,55 @@ class KakeiboWindow(QMainWindow):
         self.store.delete_memo_template(template_id)
         self._refresh_memo_combos()
         self._render_memo_templates()
+
+    def add_category_from_master(self) -> None:
+        try:
+            self.store.add_category(self.category_type.currentData(), self.category_name.text())
+        except ValueError as exc:
+            QMessageBox.information(self, "カテゴリ管理", str(exc))
+            return
+        self.category_name.clear()
+        self.refresh()
+
+    def selected_category_id(self) -> int | None:
+        row = self.category_table.currentRow()
+        if row < 0:
+            return None
+        item = self.category_table.item(row, 0)
+        return int(item.text()) if item else None
+
+    def selected_category(self) -> CategoryMaster | None:
+        category_id = self.selected_category_id()
+        if category_id is None:
+            return None
+        return next(
+            (category for category in self.category_records if category.id == category_id),
+            None,
+        )
+
+    def load_selected_category(self) -> None:
+        category = self.selected_category()
+        if category is None:
+            return
+        self.category_name.setText(category.name)
+        index = self.category_type.findData(category.transaction_type)
+        if index >= 0:
+            self.category_type.setCurrentIndex(index)
+
+    def update_selected_category(self) -> None:
+        category = self.selected_category()
+        if category is None:
+            QMessageBox.information(self, "カテゴリ管理", "編集するカテゴリを選択してください。")
+            return
+        if self.category_type.currentData() != category.transaction_type:
+            QMessageBox.information(self, "カテゴリ管理", "カテゴリの種別は変更できません。")
+            return
+        try:
+            self.store.update_category(category.id, self.category_name.text())
+        except ValueError as exc:
+            QMessageBox.information(self, "カテゴリ管理", str(exc))
+            return
+        self.refresh()
 
     def add_account(self) -> None:
         name = self.account_name.text().strip()
@@ -1393,12 +1106,14 @@ class KakeiboWindow(QMainWindow):
         self.refresh()
 
     def delete_selected_transaction(self) -> None:
-        row = self.transaction_table.currentRow()
-        if row < 0:
+        transaction_id = self.selected_transaction_id()
+        if transaction_id is None:
             QMessageBox.information(self, "削除", "削除する取引を選択してください。")
             return
-        transaction_id = int(self.transaction_table.item(row, 0).text())
         self.store.delete_transaction(transaction_id)
+        if self.editing_transaction_id == transaction_id:
+            self.editing_transaction_id = None
+            self.editing_transaction_type = None
         self.refresh()
 
     def export_ledger_pdf(self) -> None:
@@ -1406,6 +1121,15 @@ class KakeiboWindow(QMainWindow):
         title = f"{self.selected_month_text()} 口座元帳 - {account_name}"
         default_name = f"{self.selected_month.year}-{self.selected_month.month:02d}_ledger.pdf"
         self._export_table_pdf(self.ledger_table, title, default_name)
+
+    def export_category_ledger_pdf(self) -> None:
+        type_label = self.category_ledger_type.currentText().strip() or "カテゴリ"
+        category = self.category_ledger_category.currentText().strip() or "カテゴリ"
+        title = f"{self.selected_month.year}年1月1日〜{self.selected_month_text()} カテゴリ元帳 - {type_label} {category}"
+        default_name = (
+            f"{self.selected_month.year}-{self.selected_month.month:02d}_category_ledger.pdf"
+        )
+        self._export_table_pdf(self.category_ledger_table, title, default_name)
 
     def export_trial_balance_pdf(self) -> None:
         title = f"{self.selected_month_text()} 試算表"
@@ -1537,17 +1261,29 @@ class KakeiboWindow(QMainWindow):
         self.accounts = self.store.list_accounts()
         self.managed_accounts = self.store.list_accounts(active_only=False)
         self.transactions = self.store.list_transactions(month_start, next_month_start)
+        self.category_records = self.store.list_category_records()
+        self.expense_categories = [
+            category.name for category in self.category_records if category.transaction_type == "expense"
+        ]
+        self.income_categories = [
+            category.name for category in self.category_records if category.transaction_type == "income"
+        ]
+        self._refresh_category_combos()
+        self._refresh_category_ledger_category_combo()
         self._refresh_account_combos()
         self._refresh_ledger_account_combo()
         self._refresh_memo_combos()
         self._refresh_month_labels()
         self._render_transactions()
         self._render_account_ledger()
+        self._render_category_ledger()
         self._render_trial_balance()
         self._render_accounts()
+        self._render_categories()
         self._render_memo_templates()
         self._render_account_panel()
         self._render_summary()
+        self._sync_transaction_edit_controls()
 
     def _refresh_month_labels(self) -> None:
         month_text = self.selected_month_text()
@@ -1573,6 +1309,35 @@ class KakeiboWindow(QMainWindow):
             combo.blockSignals(False)
         if self.transfer_to.count() > 1 and self.transfer_to.currentIndex() == self.transfer_from.currentIndex():
             self.transfer_to.setCurrentIndex(1)
+
+    def _refresh_category_combos(self) -> None:
+        for combo, categories in (
+            (self.expense_category, self.expense_categories),
+            (self.income_category, self.income_categories),
+        ):
+            current_text = combo.currentText()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(categories)
+            if current_text:
+                index = combo.findText(current_text)
+                if index >= 0:
+                    combo.setCurrentIndex(index)
+            combo.blockSignals(False)
+
+    def _refresh_category_ledger_category_combo(self) -> None:
+        transaction_type = self.category_ledger_type.currentData() or "expense"
+        categories = self.expense_categories if transaction_type == "expense" else self.income_categories
+        current_text = self.category_ledger_category.currentText()
+        self.category_ledger_category.blockSignals(True)
+        self.category_ledger_category.clear()
+        self.category_ledger_category.addItems(categories)
+        if current_text:
+            index = self.category_ledger_category.findText(current_text)
+            if index >= 0:
+                self.category_ledger_category.setCurrentIndex(index)
+        self.category_ledger_category.blockSignals(False)
+        self._render_category_ledger()
 
     def _refresh_ledger_account_combo(self) -> None:
         current_value = self.ledger_account.currentData()
@@ -1667,6 +1432,39 @@ class KakeiboWindow(QMainWindow):
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                 self.ledger_table.setItem(row, column, item)
 
+    def _render_category_ledger(self) -> None:
+        transaction_type = self.category_ledger_type.currentData()
+        category = self.category_ledger_category.currentText()
+        if transaction_type is None or not category:
+            self.category_ledger_table.setRowCount(0)
+            return
+
+        _month_start, next_month_start = self.selected_month_range()
+        year_start = date(self.selected_month.year, 1, 1)
+        entries = self.store.category_ledger(transaction_type, category, year_start, next_month_start)
+        labels = {
+            "opening": "起点",
+            "expense": "支出",
+            "income": "収入",
+        }
+        self.category_ledger_table.setRowCount(len(entries))
+        for row, entry in enumerate(entries):
+            values = [
+                "" if entry.transaction_id is None else str(entry.transaction_id),
+                entry.occurred_on,
+                labels.get(entry.transaction_type, entry.transaction_type),
+                entry.category,
+                entry.account_name,
+                entry.memo,
+                "" if entry.amount == 0 else f"¥{entry.amount:,}",
+                f"¥{entry.balance:,}",
+            ]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                if column in (6, 7):
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                self.category_ledger_table.setItem(row, column, item)
+
     def _render_trial_balance(self) -> None:
         month_start, next_month_start = self.selected_month_range()
         rows = self.store.trial_balance(month_start, next_month_start)
@@ -1732,6 +1530,21 @@ class KakeiboWindow(QMainWindow):
             for column, value in enumerate(values):
                 self.memo_template_table.setItem(row, column, QTableWidgetItem(value))
 
+    def _render_categories(self) -> None:
+        current_id = self.selected_category_id()
+        selected_row = -1
+        self.category_table.blockSignals(True)
+        self.category_table.setRowCount(len(self.category_records))
+        for row, category in enumerate(self.category_records):
+            values = [str(category.id), category.type_label, category.name]
+            if category.id == current_id:
+                selected_row = row
+            for column, value in enumerate(values):
+                self.category_table.setItem(row, column, QTableWidgetItem(value))
+        self.category_table.blockSignals(False)
+        if selected_row >= 0:
+            self.category_table.selectRow(selected_row)
+
     def _render_account_panel(self) -> None:
         while self.account_panel.count():
             item = self.account_panel.takeAt(0)
@@ -1745,10 +1558,13 @@ class KakeiboWindow(QMainWindow):
             item = self.category_panel.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
-        for category in EXPENSE_CATEGORIES:
+        categories = list(self.expense_categories)
+        categories.extend(category for category in by_category if category not in categories)
+        for index, category in enumerate(categories):
             amount = by_category.get(category, 0)
             ratio = 0 if total == 0 else amount / total
-            self.category_panel.addWidget(CategoryBar(category, amount, ratio, CATEGORY_COLORS[category]))
+            color = CATEGORY_COLORS.get(category, CATEGORY_FALLBACK_COLORS[index % len(CATEGORY_FALLBACK_COLORS)])
+            self.category_panel.addWidget(CategoryBar(category, amount, ratio, color))
 
     def apply_style(self) -> None:
         self.setStyleSheet(
@@ -1842,6 +1658,21 @@ class KakeiboWindow(QMainWindow):
             }
             QPushButton:hover {
                 background: #334465;
+            }
+            QPushButton:disabled {
+                background: #E2DED7;
+                color: #5F6670;
+            }
+            QPushButton#deleteButton {
+                background: #9B4A3F;
+                color: #FFFFFF;
+            }
+            QPushButton#deleteButton:hover {
+                background: #7F3B32;
+            }
+            QPushButton#deleteButton:disabled {
+                background: #E2DED7;
+                color: #5F6670;
             }
             QSplitter#mainSplitter {
                 background: transparent;

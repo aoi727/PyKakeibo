@@ -1106,10 +1106,28 @@ class KakeiboWindow(QMainWindow):
         self.refresh()
 
     def delete_selected_transaction(self) -> None:
-        transaction_id = self.selected_transaction_id()
-        if transaction_id is None:
+        transaction = self.selected_transaction()
+        if transaction is None:
             QMessageBox.information(self, "削除", "削除する取引を選択してください。")
             return
+        labels = {"expense": "支出", "income": "収入", "transfer": "移動"}
+        reply = QMessageBox.question(
+            self,
+            "取引削除",
+            (
+                "この取引を削除しますか？\n\n"
+                f"日付: {transaction.occurred_on}\n"
+                f"種類: {labels.get(transaction.transaction_type, transaction.transaction_type)}\n"
+                f"カテゴリ: {transaction.category}\n"
+                f"メモ: {transaction.memo}\n"
+                f"金額: ¥{transaction.amount:,}"
+            ),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        transaction_id = transaction.id
         self.store.delete_transaction(transaction_id)
         if self.editing_transaction_id == transaction_id:
             self.editing_transaction_id = None

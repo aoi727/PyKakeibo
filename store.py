@@ -9,6 +9,7 @@ from models import (
     CATEGORY_TYPES,
     EXPENSE_CATEGORIES,
     INCOME_CATEGORIES,
+    MEMO_USAGE_TYPES,
     Account,
     CategoryLedgerEntry,
     CategoryMaster,

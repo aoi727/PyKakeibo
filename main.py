@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import ast
 import sqlite3
 import sys
 from datetime import date
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape
 from pathlib import Path
 
@@ -14,6 +16,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDateEdit,
+    QDialog,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -59,8 +62,10 @@ class SummaryCard(QFrame):
         super().__init__()
         self.setObjectName("summaryCard")
         self.title_label = QLabel(title)
+        self.title_label.setAlignment(Qt.AlignCenter)
         self.value_label = QLabel(value)
         self.value_label.setObjectName("cardValue")
+        self.value_label.setAlignment(Qt.AlignCenter)
         if accent:
             self.setStyleSheet(
                 f"""
@@ -74,8 +79,8 @@ class SummaryCard(QFrame):
             )
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(18, 14, 18, 16)
-        layout.setSpacing(6)
+        layout.setContentsMargins(12, 6, 12, 8)
+        layout.setSpacing(2)
         layout.addWidget(self.title_label)
         layout.addWidget(self.value_label)
 
@@ -151,6 +156,101 @@ class ToggleSwitch(QCheckBox):
             painter.drawLine(x, 18, x + 10, 18)
             painter.drawLine(x, 24, x + 8, 24)
 
+
+class CalculatorDialog(QDialog):
+    def __init__(self, initial_value: int, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.result_amount = initial_value
+        self.setWindowTitle("電卓")
+        self.setModal(True)
+        self.resize(300, 340)
+
+        self.expression_input = QLineEdit()
+        self.expression_input.setAlignment(Qt.AlignRight)
+        self.expression_input.setText(str(initial_value))
+
+        grid = QGridLayout()
+        buttons = [
+            ("C", 0, 0), ("BS", 0, 1), ("(", 0, 2), (")", 0, 3),
+            ("7", 1, 0), ("8", 1, 1), ("9", 1, 2), ("/", 1, 3),
+            ("4", 2, 0), ("5", 2, 1), ("6", 2, 2), ("*", 2, 3),
+            ("1", 3, 0), ("2", 3, 1), ("3", 3, 2), ("-", 3, 3),
+            ("0", 4, 0), ("00", 4, 1), (".", 4, 2), ("+", 4, 3),
+        ]
+        for text, row, column in buttons:
+            button = QPushButton(text)
+            button.setMinimumHeight(38)
+            button.clicked.connect(lambda _checked=False, value=text: self.handle_button(value))
+            grid.addWidget(button, row, column)
+
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(self.accept_result)
+        cancel_button = QPushButton("キャンセル")
+        cancel_button.clicked.connect(self.reject)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(ok_button)
+        actions.addWidget(cancel_button)
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(self.expression_input)
+        layout.addLayout(grid)
+        layout.addLayout(actions)
+
+    def handle_button(self, text: str) -> None:
+        if text == "C":
+            self.expression_input.clear()
+            return
+        if text == "BS":
+            current = self.expression_input.text()
+            self.expression_input.setText(current[:-1])
+            return
+        self.expression_input.setText(self.expression_input.text() + text)
+
+    def accept_result(self) -> None:
+        try:
+            result = self.evaluate_expression(self.expression_input.text())
+        except ValueError as exc:
+            QMessageBox.information(self, "電卓", str(exc))
+            return
+        if result < 0:
+            QMessageBox.information(self, "電卓", "金額は0円以上で入力してください。")
+            return
+        self.result_amount = int(result.to_integral_value(rounding=ROUND_HALF_UP))
+        self.accept()
+
+    @classmethod
+    def evaluate_expression(cls, expression: str) -> Decimal:
+        text = expression.strip()
+        if not text:
+            raise ValueError("計算式を入力してください。")
+        try:
+            tree = ast.parse(text, mode="eval")
+            return cls._eval_node(tree.body)
+        except (SyntaxError, InvalidOperation, ZeroDivisionError) as exc:
+            raise ValueError("計算式を確認してください。") from exc
+
+    @classmethod
+    def _eval_node(cls, node: ast.AST) -> Decimal:
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return Decimal(str(node.value))
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            value = cls._eval_node(node.operand)
+            return value if isinstance(node.op, ast.UAdd) else -value
+        if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Sub, ast.Mult, ast.Div)):
+            left = cls._eval_node(node.left)
+            right = cls._eval_node(node.right)
+            if isinstance(node.op, ast.Add):
+                return left + right
+            if isinstance(node.op, ast.Sub):
+                return left - right
+            if isinstance(node.op, ast.Mult):
+                return left * right
+            return left / right
+        raise ValueError("数字と四則演算だけを入力してください。")
+
+
 class KakeiboWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -165,7 +265,7 @@ class KakeiboWindow(QMainWindow):
         self.editing_transaction_type: str | None = None
         self.selected_month = date.today().replace(day=1)
 
-        self.setWindowTitle("My家計簿")
+        self.setWindowTitle("家計管理")
         self.setWindowIcon(QIcon(str(ICON_PATH)))
         self.resize(1160, 760)
 
@@ -201,7 +301,7 @@ class KakeiboWindow(QMainWindow):
         self.account_scroll.setObjectName("accountScroll")
         self.account_scroll.setWidgetResizable(True)
         self.account_scroll.setFrameShape(QFrame.NoFrame)
-        self.account_scroll.setMaximumHeight(190)
+        self.account_scroll.setMinimumHeight(80)
         self.account_scroll.setWidget(self.account_scroll_content)
         account_layout = QVBoxLayout(self.account_container)
         account_layout.setContentsMargins(0, 0, 0, 0)
@@ -269,12 +369,38 @@ class KakeiboWindow(QMainWindow):
         widget.setDate(QDate.currentDate())
         return widget
 
-    def _amount_input(self, allow_zero: bool = False) -> QSpinBox:
+    def _amount_input(self, allow_zero: bool = True) -> QSpinBox:
         widget = QSpinBox()
         widget.setRange(0 if allow_zero else 1, 100_000_000)
         widget.setPrefix("¥ ")
         widget.setSingleStep(1000)
         return widget
+
+    def _amount_calculator_layout(self, amount_input: QSpinBox) -> QHBoxLayout:
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+        calculator_button = QPushButton("電卓")
+        calculator_button.setFixedWidth(64)
+        calculator_button.clicked.connect(lambda: self.open_amount_calculator(amount_input))
+        layout.addWidget(amount_input)
+        layout.addWidget(calculator_button)
+        return layout
+
+    def open_amount_calculator(self, amount_input: QSpinBox) -> None:
+        dialog = CalculatorDialog(amount_input.value(), self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        if dialog.result_amount < amount_input.minimum() or dialog.result_amount > amount_input.maximum():
+            QMessageBox.information(self, "電卓", "計算結果が入力可能な金額の範囲外です。")
+            return
+        amount_input.setValue(dialog.result_amount)
+
+    def confirm_positive_transaction_amount(self, amount: int, title: str) -> bool:
+        if amount > 0:
+            return True
+        QMessageBox.information(self, title, "取引金額は1円以上で入力してください。")
+        return False
 
     def _balance_input(self) -> QSpinBox:
         widget = QSpinBox()
@@ -297,11 +423,14 @@ class KakeiboWindow(QMainWindow):
         layout.setSpacing(18)
 
         hero = QHBoxLayout()
-        title_group = QVBoxLayout()
-        title = QLabel("My家計簿")
+        title = QLabel("家計管理")
         title.setObjectName("appTitle")
-        title_group.addWidget(title)
-        hero.addLayout(title_group)
+        hero.addWidget(title)
+        hero.addSpacing(8)
+        for card in (self.assets_card, self.expense_card, self.income_card):
+            card.setFixedWidth(235)
+            card.setFixedHeight(74)
+            hero.addWidget(card)
         hero.addStretch()
         previous_month_button = QPushButton("前月")
         previous_month_button.clicked.connect(self.show_previous_month)
@@ -314,13 +443,6 @@ class KakeiboWindow(QMainWindow):
         hero.addWidget(self.month_label)
         hero.addWidget(next_month_button)
         layout.addLayout(hero)
-
-        cards = QGridLayout()
-        cards.setHorizontalSpacing(14)
-        cards.addWidget(self.assets_card, 0, 0)
-        cards.addWidget(self.expense_card, 0, 1)
-        cards.addWidget(self.income_card, 0, 2)
-        layout.addLayout(cards)
 
         content = QSplitter(Qt.Horizontal)
         content.setObjectName("mainSplitter")
@@ -386,6 +508,11 @@ class KakeiboWindow(QMainWindow):
         layout.setContentsMargins(18, 18, 18, 18)
         layout.setSpacing(14)
 
+        asset_section = QWidget()
+        asset_layout = QVBoxLayout(asset_section)
+        asset_layout.setContentsMargins(0, 0, 0, 0)
+        asset_layout.setSpacing(10)
+
         asset_header = QHBoxLayout()
         title = QLabel("口座残高")
         title.setObjectName("smallSectionTitle")
@@ -393,17 +520,32 @@ class KakeiboWindow(QMainWindow):
         asset_header.addStretch()
         asset_header.addWidget(self.asset_toggle)
 
+        category_section = QWidget()
+        category_layout = QVBoxLayout(category_section)
+        category_layout.setContentsMargins(0, 0, 0, 0)
+        category_layout.setSpacing(10)
+
         category_scroll = QScrollArea()
         category_scroll.setObjectName("categoryScroll")
         category_scroll.setWidgetResizable(True)
         category_scroll.setFrameShape(QFrame.NoFrame)
         category_scroll.setWidget(self.category_container)
 
-        layout.addLayout(asset_header)
-        layout.addWidget(self.account_container)
-        layout.addSpacing(8)
-        layout.addWidget(self.category_title)
-        layout.addWidget(category_scroll, 1)
+        asset_layout.addLayout(asset_header)
+        asset_layout.addWidget(self.account_container, 1)
+
+        category_layout.addWidget(self.category_title)
+        category_layout.addWidget(category_scroll, 1)
+
+        right_splitter = QSplitter(Qt.Vertical)
+        right_splitter.setObjectName("rightSplitter")
+        right_splitter.setChildrenCollapsible(False)
+        right_splitter.addWidget(asset_section)
+        right_splitter.addWidget(category_section)
+        right_splitter.setStretchFactor(0, 1)
+        right_splitter.setStretchFactor(1, 2)
+        right_splitter.setSizes([220, 420])
+        layout.addWidget(right_splitter, 1)
         return panel
 
     def _expense_tab(self) -> QWidget:
@@ -430,7 +572,7 @@ class KakeiboWindow(QMainWindow):
         layout.addWidget(self.expense_memo, 1, 3)
         layout.addWidget(save_memo_button, 1, 4)
         layout.addWidget(QLabel("金額"), 2, 0)
-        layout.addWidget(self.expense_amount, 2, 1)
+        layout.addLayout(self._amount_calculator_layout(self.expense_amount), 2, 1)
         layout.addWidget(self.expense_add_button, 2, 3)
         layout.addWidget(self.expense_update_button, 2, 4)
         layout.addWidget(self.expense_cancel_edit_button, 2, 5)
@@ -460,7 +602,7 @@ class KakeiboWindow(QMainWindow):
         layout.addWidget(self.income_memo, 1, 3)
         layout.addWidget(save_memo_button, 1, 4)
         layout.addWidget(QLabel("金額"), 2, 0)
-        layout.addWidget(self.income_amount, 2, 1)
+        layout.addLayout(self._amount_calculator_layout(self.income_amount), 2, 1)
         layout.addWidget(self.income_add_button, 2, 3)
         layout.addWidget(self.income_update_button, 2, 4)
         layout.addWidget(self.income_cancel_edit_button, 2, 5)
@@ -490,7 +632,7 @@ class KakeiboWindow(QMainWindow):
         layout.addWidget(self.transfer_memo, 1, 3)
         layout.addWidget(save_memo_button, 1, 4)
         layout.addWidget(QLabel("金額"), 2, 0)
-        layout.addWidget(self.transfer_amount, 2, 1)
+        layout.addLayout(self._amount_calculator_layout(self.transfer_amount), 2, 1)
         layout.addWidget(self.transfer_add_button, 2, 3)
         layout.addWidget(self.transfer_update_button, 2, 4)
         layout.addWidget(self.transfer_cancel_edit_button, 2, 5)
@@ -548,19 +690,37 @@ class KakeiboWindow(QMainWindow):
         update_button.clicked.connect(self.update_selected_account)
         visibility_button = QPushButton("表示/非表示")
         visibility_button.clicked.connect(self.toggle_selected_account_visibility)
+        up_button = QPushButton("上へ")
+        up_button.clicked.connect(self.move_selected_account_up)
+        down_button = QPushButton("下へ")
+        down_button.clicked.connect(self.move_selected_account_down)
         delete_button = QPushButton("未使用口座を削除")
         delete_button.setObjectName("deleteButton")
         delete_button.clicked.connect(self.delete_selected_account)
+        for button in (
+            add_button,
+            update_button,
+            visibility_button,
+            up_button,
+            down_button,
+            delete_button,
+        ):
+            button.setFixedSize(160, 38)
         form.addWidget(QLabel("種別"), 0, 0)
         form.addWidget(self.account_type, 0, 1)
         form.addWidget(QLabel("口座名"), 0, 2)
         form.addWidget(self.account_name, 0, 3)
-        form.addWidget(QLabel("開始残高"), 1, 0)
-        form.addWidget(self.account_opening, 1, 1)
-        form.addWidget(add_button, 1, 2)
-        form.addWidget(update_button, 1, 3)
-        form.addWidget(visibility_button, 2, 2)
-        form.addWidget(delete_button, 2, 3)
+        form.addWidget(QLabel("開始残高"), 0, 4)
+        form.addWidget(self.account_opening, 0, 5)
+        button_row = QHBoxLayout()
+        button_row.addWidget(add_button)
+        button_row.addWidget(update_button)
+        button_row.addWidget(visibility_button)
+        button_row.addWidget(delete_button)
+        button_row.addWidget(up_button)
+        button_row.addWidget(down_button)
+        button_row.addStretch()
+        form.addLayout(button_row, 1, 0, 1, 6)
         layout.addLayout(form)
         layout.addWidget(self.account_table)
         return tab
@@ -573,6 +733,13 @@ class KakeiboWindow(QMainWindow):
         add_button.clicked.connect(self.add_category_from_master)
         update_button = QPushButton("選択カテゴリを更新")
         update_button.clicked.connect(self.update_selected_category)
+        up_button = QPushButton("上へ")
+        up_button.clicked.connect(self.move_selected_category_up)
+        down_button = QPushButton("下へ")
+        down_button.clicked.connect(self.move_selected_category_down)
+        delete_button = QPushButton("未使用カテゴリを削除")
+        delete_button.setObjectName("deleteButton")
+        delete_button.clicked.connect(self.delete_selected_category)
 
         form.addWidget(QLabel("種別"), 0, 0)
         form.addWidget(self.category_type, 0, 1)
@@ -580,6 +747,9 @@ class KakeiboWindow(QMainWindow):
         form.addWidget(self.category_name, 0, 3)
         form.addWidget(add_button, 0, 4)
         form.addWidget(update_button, 0, 5)
+        form.addWidget(up_button, 1, 0)
+        form.addWidget(down_button, 1, 1)
+        form.addWidget(delete_button, 1, 5)
         layout.addLayout(form)
         layout.addWidget(self.category_table)
         return tab
@@ -728,6 +898,8 @@ class KakeiboWindow(QMainWindow):
         if self.editing_transaction_id is not None:
             QMessageBox.information(self, "取引編集", "編集中は新規追加できません。")
             return
+        if not self.confirm_positive_transaction_amount(self.expense_amount.value(), "支出"):
+            return
         if not self.confirm_registration_date(self.expense_date.date()):
             return
         self.store.add_expense(
@@ -738,12 +910,14 @@ class KakeiboWindow(QMainWindow):
             self.expense_amount.value(),
         )
         self.expense_memo.clearEditText()
-        self.expense_amount.setValue(1)
+        self.expense_amount.setValue(0)
         self.refresh()
 
     def add_income(self) -> None:
         if self.editing_transaction_id is not None:
             QMessageBox.information(self, "取引編集", "編集中は新規追加できません。")
+            return
+        if not self.confirm_positive_transaction_amount(self.income_amount.value(), "収入"):
             return
         if not self.confirm_registration_date(self.income_date.date()):
             return
@@ -755,12 +929,14 @@ class KakeiboWindow(QMainWindow):
             self.income_amount.value(),
         )
         self.income_memo.clearEditText()
-        self.income_amount.setValue(1)
+        self.income_amount.setValue(0)
         self.refresh()
 
     def add_transfer(self) -> None:
         if self.editing_transaction_id is not None:
             QMessageBox.information(self, "取引編集", "編集中は新規追加できません。")
+            return
+        if not self.confirm_positive_transaction_amount(self.transfer_amount.value(), "資金移動"):
             return
         if not self.confirm_registration_date(self.transfer_date.date()):
             return
@@ -776,7 +952,7 @@ class KakeiboWindow(QMainWindow):
             QMessageBox.information(self, "資金移動", str(exc))
             return
         self.transfer_memo.clearEditText()
-        self.transfer_amount.setValue(1)
+        self.transfer_amount.setValue(0)
         self.refresh()
 
     def _sync_transaction_edit_controls(self) -> None:
@@ -880,6 +1056,8 @@ class KakeiboWindow(QMainWindow):
 
         try:
             if self.editing_transaction_type == "expense":
+                if not self.confirm_positive_transaction_amount(self.expense_amount.value(), "取引編集"):
+                    return
                 self.store.update_transaction(
                     self.editing_transaction_id,
                     self.expense_date.date().toString("yyyy-MM-dd"),
@@ -891,8 +1069,10 @@ class KakeiboWindow(QMainWindow):
                     self.expense_amount.value(),
                 )
                 self.expense_memo.clearEditText()
-                self.expense_amount.setValue(1)
+                self.expense_amount.setValue(0)
             elif self.editing_transaction_type == "income":
+                if not self.confirm_positive_transaction_amount(self.income_amount.value(), "取引編集"):
+                    return
                 self.store.update_transaction(
                     self.editing_transaction_id,
                     self.income_date.date().toString("yyyy-MM-dd"),
@@ -904,8 +1084,10 @@ class KakeiboWindow(QMainWindow):
                     self.income_amount.value(),
                 )
                 self.income_memo.clearEditText()
-                self.income_amount.setValue(1)
+                self.income_amount.setValue(0)
             elif self.editing_transaction_type == "transfer":
+                if not self.confirm_positive_transaction_amount(self.transfer_amount.value(), "取引編集"):
+                    return
                 self.store.update_transaction(
                     self.editing_transaction_id,
                     self.transfer_date.date().toString("yyyy-MM-dd"),
@@ -917,7 +1099,7 @@ class KakeiboWindow(QMainWindow):
                     self.transfer_amount.value(),
                 )
                 self.transfer_memo.clearEditText()
-                self.transfer_amount.setValue(1)
+                self.transfer_amount.setValue(0)
         except ValueError as exc:
             QMessageBox.information(self, "取引編集", str(exc))
             return
@@ -1011,6 +1193,51 @@ class KakeiboWindow(QMainWindow):
             return
         self.refresh()
 
+    def delete_selected_category(self) -> None:
+        category = self.selected_category()
+        if category is None:
+            QMessageBox.information(self, "カテゴリ管理", "削除するカテゴリを選択してください。")
+            return
+        transaction_count = self.store.category_transaction_count(category.id)
+        if transaction_count > 0:
+            QMessageBox.information(
+                self,
+                "カテゴリ管理",
+                (
+                    f"{category.name} は {transaction_count} 件の取引で使われているため削除できません。\n"
+                    "該当取引を削除するか、別カテゴリへ変更してから削除してください。"
+                ),
+            )
+            return
+        reply = QMessageBox.question(
+            self,
+            "カテゴリ削除",
+            f"{category.type_label}カテゴリ「{category.name}」を削除しますか？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        self.store.delete_category(category.id)
+        self.category_name.clear()
+        self.refresh()
+
+    def move_selected_category_up(self) -> None:
+        category = self.selected_category()
+        if category is None:
+            QMessageBox.information(self, "カテゴリ表示順", "移動するカテゴリを選択してください。")
+            return
+        self.store.move_category(category.id, -1)
+        self.refresh()
+
+    def move_selected_category_down(self) -> None:
+        category = self.selected_category()
+        if category is None:
+            QMessageBox.information(self, "カテゴリ表示順", "移動するカテゴリを選択してください。")
+            return
+        self.store.move_category(category.id, 1)
+        self.refresh()
+
     def add_account(self) -> None:
         name = self.account_name.text().strip()
         if not name:
@@ -1081,6 +1308,22 @@ class KakeiboWindow(QMainWindow):
             QMessageBox.information(self, "口座表示", "表示/非表示を切り替える口座を選択してください。")
             return
         self.store.set_account_active(account.id, not bool(account.is_active))
+        self.refresh()
+
+    def move_selected_account_up(self) -> None:
+        account = self.selected_account()
+        if account is None:
+            QMessageBox.information(self, "口座表示順", "移動する口座を選択してください。")
+            return
+        self.store.move_account(account.id, -1)
+        self.refresh()
+
+    def move_selected_account_down(self) -> None:
+        account = self.selected_account()
+        if account is None:
+            QMessageBox.information(self, "口座表示順", "移動する口座を選択してください。")
+            return
+        self.store.move_account(account.id, 1)
         self.refresh()
 
     def delete_selected_account(self) -> None:
@@ -1306,8 +1549,8 @@ class KakeiboWindow(QMainWindow):
     def _refresh_month_labels(self) -> None:
         month_text = self.selected_month_text()
         self.month_label.setText(month_text)
-        self.expense_card.set_title(f"{month_text}の支出")
-        self.income_card.set_title(f"{month_text}の収入")
+        self.expense_card.set_title(f"{month_text}の支出（資金移動を含む）")
+        self.income_card.set_title(f"{month_text}の収入（資金移動を含む）")
         self.history_label.setText(f"{month_text}の取引")
         self.category_title.setText(f"{month_text}の支出内訳")
 
@@ -1602,7 +1845,7 @@ class KakeiboWindow(QMainWindow):
                 border: 1px solid #DED6CC;
             }
             #appTitle {
-                font-size: 34px;
+                font-size: 28px;
                 font-weight: 800;
                 color: #25324A;
                 background: transparent;
@@ -1631,7 +1874,7 @@ class KakeiboWindow(QMainWindow):
                 min-width: 112px;
             }
             #cardValue {
-                font-size: 26px;
+                font-size: 20px;
                 font-weight: 800;
                 color: #25324A;
                 background: transparent;
@@ -1692,15 +1935,15 @@ class KakeiboWindow(QMainWindow):
                 background: #E2DED7;
                 color: #5F6670;
             }
-            QSplitter#mainSplitter {
+            QSplitter#mainSplitter, QSplitter#leftSplitter, QSplitter#rightSplitter {
                 background: transparent;
             }
-            QSplitter#mainSplitter::handle {
+            QSplitter#mainSplitter::handle, QSplitter#leftSplitter::handle, QSplitter#rightSplitter::handle {
                 background: #DED6CC;
                 border-radius: 2px;
                 margin: 4px 6px;
             }
-            QSplitter#mainSplitter::handle:hover {
+            QSplitter#mainSplitter::handle:hover, QSplitter#leftSplitter::handle:hover, QSplitter#rightSplitter::handle:hover {
                 background: #B9AFA3;
             }
             QScrollArea#categoryScroll, QScrollArea#accountScroll {
@@ -1781,7 +2024,7 @@ class CategoryBar(QWidget):
 
 def main() -> int:
     app = QApplication(sys.argv)
-    app.setApplicationName("My家計簿")
+    app.setApplicationName("家計管理")
     app.setWindowIcon(QIcon(str(ICON_PATH)))
     window = KakeiboWindow()
     window.show()

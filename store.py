@@ -27,6 +27,8 @@ class KakeiboStore:
         self._seed_accounts()
         self._seed_categories()
         self._migrate_legacy_entries()
+        self._seed_categories()
+        self._normalize_sort_orders()
 
     def _connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
@@ -43,6 +45,7 @@ class KakeiboStore:
                     account_type TEXT NOT NULL,
                     opening_balance INTEGER NOT NULL DEFAULT 0,
                     is_active INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -94,6 +97,26 @@ class KakeiboStore:
                 conn.execute(
                     "ALTER TABLE memo_templates ADD COLUMN usage_type TEXT NOT NULL DEFAULT 'common'"
                 )
+            account_columns = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(accounts)").fetchall()
+            }
+            if "sort_order" not in account_columns:
+                conn.execute("ALTER TABLE accounts ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+                conn.execute(
+                    """
+                    UPDATE accounts
+                    SET sort_order =
+                        CASE account_type
+                            WHEN 'cash' THEN 0
+                            WHEN 'bank' THEN 1000
+                            WHEN 'deposit' THEN 2000
+                            WHEN 'pay' THEN 3000
+                            WHEN 'credit_card' THEN 4000
+                            ELSE 5000
+                        END + id
+                    """
+                )
 
     def _seed_accounts(self) -> None:
         with self._connect() as conn:
@@ -101,14 +124,14 @@ class KakeiboStore:
             if count:
                 return
             defaults = [
-                ("現金", "cash", 0),
-                ("普通預金1", "bank", 0),
-                ("普通預金2", "bank", 0),
-                ("定期預金等1", "deposit", 0),
-                ("Pay支払1", "pay", 0),
+                ("現金", "cash", 0, 0),
+                ("普通預金1", "bank", 0, 1),
+                ("普通預金2", "bank", 0, 2),
+                ("定期預金等1", "deposit", 0, 3),
+                ("Pay支払1", "pay", 0, 4),
             ]
             conn.executemany(
-                "INSERT INTO accounts (name, account_type, opening_balance) VALUES (?, ?, ?)",
+                "INSERT INTO accounts (name, account_type, opening_balance, sort_order) VALUES (?, ?, ?, ?)",
                 defaults,
             )
 
@@ -135,6 +158,39 @@ class KakeiboStore:
                 GROUP BY transaction_type, category
                 """
             )
+
+    def _normalize_sort_orders(self) -> None:
+        with self._connect() as conn:
+            account_rows = conn.execute(
+                "SELECT id FROM accounts ORDER BY sort_order, id"
+            ).fetchall()
+            for index, row in enumerate(account_rows):
+                conn.execute(
+                    "UPDATE accounts SET sort_order = ? WHERE id = ?",
+                    (index, row["id"]),
+                )
+
+            category_types = [
+                row["transaction_type"]
+                for row in conn.execute(
+                    "SELECT DISTINCT transaction_type FROM categories ORDER BY transaction_type"
+                ).fetchall()
+            ]
+            for transaction_type in category_types:
+                category_rows = conn.execute(
+                    """
+                    SELECT id
+                    FROM categories
+                    WHERE transaction_type = ?
+                    ORDER BY sort_order, id
+                    """,
+                    (transaction_type,),
+                ).fetchall()
+                for index, row in enumerate(category_rows):
+                    conn.execute(
+                        "UPDATE categories SET sort_order = ? WHERE id = ?",
+                        (index, row["id"]),
+                    )
 
     def _migrate_legacy_entries(self) -> None:
         with self._connect() as conn:
@@ -172,9 +228,15 @@ class KakeiboStore:
 
     def add_account(self, name: str, account_type: str, opening_balance: int) -> None:
         with self._connect() as conn:
+            sort_order = conn.execute(
+                "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM accounts"
+            ).fetchone()[0]
             conn.execute(
-                "INSERT INTO accounts (name, account_type, opening_balance) VALUES (?, ?, ?)",
-                (name, account_type, opening_balance),
+                """
+                INSERT INTO accounts (name, account_type, opening_balance, sort_order)
+                VALUES (?, ?, ?, ?)
+                """,
+                (name, account_type, opening_balance, sort_order),
             )
 
     def update_account(self, account_id: int, name: str, account_type: str, opening_balance: int) -> None:
@@ -285,6 +347,64 @@ class KakeiboStore:
                 (text, row["transaction_type"], row["name"]),
             )
 
+    def category_transaction_count(self, category_id: int) -> int:
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT transaction_type, name FROM categories WHERE id = ?",
+                (category_id,),
+            ).fetchone()
+            if row is None:
+                return 0
+            return int(
+                conn.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM transactions
+                    WHERE transaction_type = ? AND category = ?
+                    """,
+                    (row["transaction_type"], row["name"]),
+                ).fetchone()[0]
+            )
+
+    def delete_category(self, category_id: int) -> None:
+        if self.category_transaction_count(category_id) > 0:
+            raise ValueError("取引で使われているカテゴリは削除できません。")
+        with self._connect() as conn:
+            conn.execute("DELETE FROM categories WHERE id = ?", (category_id,))
+
+    def move_category(self, category_id: int, direction: int) -> None:
+        if direction == 0:
+            return
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT id, transaction_type, sort_order FROM categories WHERE id = ?",
+                (category_id,),
+            ).fetchone()
+            if current is None:
+                return
+            comparator = "<" if direction < 0 else ">"
+            order = "DESC" if direction < 0 else "ASC"
+            target = conn.execute(
+                f"""
+                SELECT id, sort_order
+                FROM categories
+                WHERE transaction_type = ? AND sort_order {comparator} ?
+                ORDER BY sort_order {order}, id {order}
+                LIMIT 1
+                """,
+                (current["transaction_type"], current["sort_order"]),
+            ).fetchone()
+            if target is None:
+                return
+            conn.execute(
+                "UPDATE categories SET sort_order = ? WHERE id = ?",
+                (target["sort_order"], current["id"]),
+            )
+            conn.execute(
+                "UPDATE categories SET sort_order = ? WHERE id = ?",
+                (current["sort_order"], target["id"]),
+            )
+
     def list_accounts(self, active_only: bool = True) -> list[Account]:
         where = "WHERE is_active = 1" if active_only else ""
         with self._connect() as conn:
@@ -293,16 +413,7 @@ class KakeiboStore:
                 SELECT id, name, account_type, opening_balance, is_active
                 FROM accounts
                 {where}
-                ORDER BY
-                    CASE account_type
-                        WHEN 'cash' THEN 0
-                        WHEN 'bank' THEN 1
-                        WHEN 'deposit' THEN 2
-                        WHEN 'pay' THEN 3
-                        WHEN 'credit_card' THEN 4
-                        ELSE 5
-                    END,
-                    id
+                ORDER BY sort_order, id
                 """
             ).fetchall()
         balances = self.account_balances()
@@ -317,6 +428,39 @@ class KakeiboStore:
             )
             for row in rows
         ]
+
+    def move_account(self, account_id: int, direction: int) -> None:
+        if direction == 0:
+            return
+        with self._connect() as conn:
+            current = conn.execute(
+                "SELECT id, sort_order FROM accounts WHERE id = ?",
+                (account_id,),
+            ).fetchone()
+            if current is None:
+                return
+            comparator = "<" if direction < 0 else ">"
+            order = "DESC" if direction < 0 else "ASC"
+            target = conn.execute(
+                f"""
+                SELECT id, sort_order
+                FROM accounts
+                WHERE sort_order {comparator} ?
+                ORDER BY sort_order {order}, id {order}
+                LIMIT 1
+                """,
+                (current["sort_order"],),
+            ).fetchone()
+            if target is None:
+                return
+            conn.execute(
+                "UPDATE accounts SET sort_order = ? WHERE id = ?",
+                (target["sort_order"], current["id"]),
+            )
+            conn.execute(
+                "UPDATE accounts SET sort_order = ? WHERE id = ?",
+                (current["sort_order"], target["id"]),
+            )
 
     def account_balances(self) -> dict[int, int]:
         with self._connect() as conn:

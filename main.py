@@ -8,12 +8,11 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import QDate, QRectF, QSize, Qt
-from PySide6.QtGui import QColor, QIcon, QPainter, QPen, QTextDocument
+from PySide6.QtCore import QByteArray, QDate, QSettings, QSize, Qt
+from PySide6.QtGui import QIcon, QTextDocument
 from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtWidgets import (
     QApplication,
-    QCheckBox,
     QComboBox,
     QDateEdit,
     QDialog,
@@ -29,6 +28,7 @@ from PySide6.QtWidgets import (
     QProgressBar,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSplitter,
     QSpinBox,
     QTabWidget,
@@ -89,72 +89,6 @@ class SummaryCard(QFrame):
 
     def set_value(self, value: str) -> None:
         self.value_label.setText(value)
-
-
-class ToggleSwitch(QCheckBox):
-    def __init__(self) -> None:
-        super().__init__()
-        self.setCursor(Qt.PointingHandCursor)
-        self.setFixedSize(self.sizeHint())
-        self.setText("")
-
-    def sizeHint(self) -> QSize:
-        return QSize(104, 48)
-
-    def hitButton(self, pos) -> bool:  # type: ignore[override]
-        return self.rect().contains(pos)
-
-    def paintEvent(self, event) -> None:  # type: ignore[override]
-        del event
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.Antialiasing)
-
-        checked = self.isChecked()
-        track = QRectF(2, 5, 100, 38)
-        radius = track.height() / 2
-        track_color = QColor("#00D46A") if checked else QColor("#F1F1F1")
-        border_color = QColor("#16AF5E") if checked else QColor("#D3D3D3")
-
-        painter.setPen(QPen(border_color, 1.4))
-        painter.setBrush(track_color)
-        painter.drawRoundedRect(track, radius, radius)
-
-        knob_size = 42
-        knob_x = 59 if checked else 3
-        knob_y = 3
-        shadow = QRectF(knob_x + 1, knob_y + 4, knob_size, knob_size)
-        knob = QRectF(knob_x, knob_y, knob_size, knob_size)
-
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 36))
-        painter.drawEllipse(shadow)
-
-        painter.setPen(QPen(QColor("#CFCFCF"), 1))
-        painter.setBrush(QColor("#FAFAFA"))
-        painter.drawEllipse(knob)
-
-        label_color = QColor("#069D54") if checked else QColor("#B8B8B8")
-        if checked:
-            self._draw_on_label(painter, label_color)
-        else:
-            self._draw_off_label(painter, label_color)
-
-    def _draw_on_label(self, painter: QPainter, color: QColor) -> None:
-        painter.setPen(QPen(color, 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawEllipse(QRectF(18, 18, 13, 13))
-        painter.drawLine(36, 31, 36, 18)
-        painter.drawLine(36, 18, 49, 31)
-        painter.drawLine(49, 31, 49, 18)
-
-    def _draw_off_label(self, painter: QPainter, color: QColor) -> None:
-        painter.setPen(QPen(color, 2, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawEllipse(QRectF(54, 18, 12, 12))
-        for x in (72, 86):
-            painter.drawLine(x, 31, x, 18)
-            painter.drawLine(x, 18, x + 10, 18)
-            painter.drawLine(x, 24, x + 8, 24)
 
 
 class CalculatorDialog(QDialog):
@@ -261,8 +195,10 @@ class KakeiboWindow(QMainWindow):
         self.expense_categories: list[str] = []
         self.income_categories: list[str] = []
         self.category_records: list[CategoryMaster] = []
+        self.settings = QSettings("Honlabo", "PyKakeibo")
         self.editing_transaction_id: int | None = None
         self.editing_transaction_type: str | None = None
+        self.return_to_ledger_after_transaction = False
         self.selected_month = date.today().replace(day=1)
 
         self.setWindowTitle("家計管理")
@@ -301,14 +237,12 @@ class KakeiboWindow(QMainWindow):
         self.account_scroll.setObjectName("accountScroll")
         self.account_scroll.setWidgetResizable(True)
         self.account_scroll.setFrameShape(QFrame.NoFrame)
-        self.account_scroll.setMinimumHeight(80)
+        self.account_scroll.setMinimumHeight(1)
+        self.account_scroll.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         self.account_scroll.setWidget(self.account_scroll_content)
         account_layout = QVBoxLayout(self.account_container)
         account_layout.setContentsMargins(0, 0, 0, 0)
         account_layout.addWidget(self.account_scroll)
-        self.account_container.setVisible(False)
-        self.asset_toggle = ToggleSwitch()
-        self.asset_toggle.toggled.connect(self.account_container.setVisible)
 
         self.category_container = QWidget()
         self.category_panel = QVBoxLayout(self.category_container)
@@ -361,7 +295,43 @@ class KakeiboWindow(QMainWindow):
 
         self.setCentralWidget(self._build_ui())
         self.apply_style()
+        self.restore_window_settings()
         self.refresh()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self.save_window_settings()
+        super().closeEvent(event)
+
+    def save_window_settings(self) -> None:
+        self.settings.setValue("window/size", self.size())
+        self.settings.setValue("splitter/main", self.main_splitter.saveState())
+        self.settings.setValue("splitter/left", self.left_splitter.saveState())
+        self.settings.setValue("splitter/right", self.right_splitter.saveState())
+        self.settings.sync()
+
+    def restore_window_settings(self) -> None:
+        saved_size = self.settings.value("window/size")
+        if not isinstance(saved_size, QSize):
+            return
+
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is None:
+            return
+        available_size = screen.availableGeometry().size()
+        if saved_size.width() > available_size.width() or saved_size.height() > available_size.height():
+            return
+
+        self.resize(saved_size)
+        self._restore_splitter_state(self.main_splitter, "splitter/main")
+        self._restore_splitter_state(self.left_splitter, "splitter/left")
+        self._restore_splitter_state(self.right_splitter, "splitter/right")
+
+    def _restore_splitter_state(self, splitter: QSplitter, key: str) -> None:
+        state = self.settings.value(key)
+        if isinstance(state, QByteArray):
+            splitter.restoreState(state)
+        elif isinstance(state, bytes):
+            splitter.restoreState(QByteArray(state))
 
     def _date_input(self) -> QDateEdit:
         widget = QDateEdit()
@@ -428,7 +398,7 @@ class KakeiboWindow(QMainWindow):
         hero.addWidget(title)
         hero.addSpacing(8)
         for card in (self.assets_card, self.expense_card, self.income_card):
-            card.setFixedWidth(235)
+            card.setFixedWidth(275)
             card.setFixedHeight(74)
             hero.addWidget(card)
         hero.addStretch()
@@ -444,15 +414,15 @@ class KakeiboWindow(QMainWindow):
         hero.addWidget(next_month_button)
         layout.addLayout(hero)
 
-        content = QSplitter(Qt.Horizontal)
-        content.setObjectName("mainSplitter")
-        content.setChildrenCollapsible(False)
-        content.addWidget(self._build_left_panel())
-        content.addWidget(self._build_right_panel())
-        content.setStretchFactor(0, 3)
-        content.setStretchFactor(1, 2)
-        content.setSizes([700, 430])
-        layout.addWidget(content, 1)
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setObjectName("mainSplitter")
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.addWidget(self._build_left_panel())
+        self.main_splitter.addWidget(self._build_right_panel())
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 2)
+        self.main_splitter.setSizes([700, 430])
+        layout.addWidget(self.main_splitter, 1)
         return root
 
     def _build_left_panel(self) -> QWidget:
@@ -490,15 +460,15 @@ class KakeiboWindow(QMainWindow):
         history_layout.addLayout(history_header)
         history_layout.addWidget(self.transaction_table)
 
-        left_splitter = QSplitter(Qt.Vertical)
-        left_splitter.setObjectName("leftSplitter")
-        left_splitter.setChildrenCollapsible(False)
-        left_splitter.addWidget(self.transaction_tabs)
-        left_splitter.addWidget(history_panel)
-        left_splitter.setStretchFactor(0, 1)
-        left_splitter.setStretchFactor(1, 2)
-        left_splitter.setSizes([260, 420])
-        layout.addWidget(left_splitter, 1)
+        self.left_splitter = QSplitter(Qt.Vertical)
+        self.left_splitter.setObjectName("leftSplitter")
+        self.left_splitter.setChildrenCollapsible(False)
+        self.left_splitter.addWidget(self.transaction_tabs)
+        self.left_splitter.addWidget(history_panel)
+        self.left_splitter.setStretchFactor(0, 1)
+        self.left_splitter.setStretchFactor(1, 2)
+        self.left_splitter.setSizes([260, 420])
+        layout.addWidget(self.left_splitter, 1)
         return panel
 
     def _build_right_panel(self) -> QWidget:
@@ -515,10 +485,9 @@ class KakeiboWindow(QMainWindow):
 
         asset_header = QHBoxLayout()
         title = QLabel("口座残高")
-        title.setObjectName("smallSectionTitle")
+        title.setObjectName("sectionTitle")
         asset_header.addWidget(title)
         asset_header.addStretch()
-        asset_header.addWidget(self.asset_toggle)
 
         category_section = QWidget()
         category_layout = QVBoxLayout(category_section)
@@ -537,15 +506,15 @@ class KakeiboWindow(QMainWindow):
         category_layout.addWidget(self.category_title)
         category_layout.addWidget(category_scroll, 1)
 
-        right_splitter = QSplitter(Qt.Vertical)
-        right_splitter.setObjectName("rightSplitter")
-        right_splitter.setChildrenCollapsible(False)
-        right_splitter.addWidget(asset_section)
-        right_splitter.addWidget(category_section)
-        right_splitter.setStretchFactor(0, 1)
-        right_splitter.setStretchFactor(1, 2)
-        right_splitter.setSizes([220, 420])
-        layout.addWidget(right_splitter, 1)
+        self.right_splitter = QSplitter(Qt.Vertical)
+        self.right_splitter.setObjectName("rightSplitter")
+        self.right_splitter.setChildrenCollapsible(False)
+        self.right_splitter.addWidget(asset_section)
+        self.right_splitter.addWidget(category_section)
+        self.right_splitter.setStretchFactor(0, 1)
+        self.right_splitter.setStretchFactor(1, 2)
+        self.right_splitter.setSizes([220, 420])
+        layout.addWidget(self.right_splitter, 1)
         return panel
 
     def _expense_tab(self) -> QWidget:
@@ -645,8 +614,18 @@ class KakeiboWindow(QMainWindow):
         controls.addWidget(QLabel("口座"))
         controls.addWidget(self.ledger_account)
         controls.addStretch()
+        add_button = QPushButton("追加")
+        add_button.clicked.connect(self.add_transaction_from_ledger)
+        edit_button = QPushButton("変更")
+        edit_button.clicked.connect(self.load_selected_ledger_transaction_for_edit)
+        delete_button = QPushButton("削除")
+        delete_button.setObjectName("deleteButton")
+        delete_button.clicked.connect(self.delete_selected_ledger_transaction)
         export_button = QPushButton("PDF保存")
         export_button.clicked.connect(self.export_ledger_pdf)
+        controls.addWidget(add_button)
+        controls.addWidget(edit_button)
+        controls.addWidget(delete_button)
         controls.addWidget(export_button)
         layout.addLayout(controls)
         layout.addWidget(self.ledger_table)
@@ -911,7 +890,7 @@ class KakeiboWindow(QMainWindow):
         )
         self.expense_memo.clearEditText()
         self.expense_amount.setValue(0)
-        self.refresh()
+        self.finish_transaction_entry()
 
     def add_income(self) -> None:
         if self.editing_transaction_id is not None:
@@ -930,7 +909,7 @@ class KakeiboWindow(QMainWindow):
         )
         self.income_memo.clearEditText()
         self.income_amount.setValue(0)
-        self.refresh()
+        self.finish_transaction_entry()
 
     def add_transfer(self) -> None:
         if self.editing_transaction_id is not None:
@@ -953,7 +932,49 @@ class KakeiboWindow(QMainWindow):
             return
         self.transfer_memo.clearEditText()
         self.transfer_amount.setValue(0)
+        self.finish_transaction_entry()
+
+    def finish_transaction_entry(self) -> None:
+        return_to_ledger = self.return_to_ledger_after_transaction
+        self.return_to_ledger_after_transaction = False
         self.refresh()
+        if return_to_ledger:
+            self.transaction_tabs.setCurrentIndex(3)
+
+    def add_transaction_from_ledger(self) -> None:
+        if self.editing_transaction_id is not None:
+            QMessageBox.information(self, "口座元帳", "取引編集中は新規追加できません。")
+            return
+        account_id = self.ledger_account.currentData()
+        if account_id is None:
+            QMessageBox.information(self, "口座元帳", "取引を追加する口座を選択してください。")
+            return
+
+        ledger_date = QDate(self.selected_month.year, self.selected_month.month, 1)
+        self.return_to_ledger_after_transaction = True
+
+        self.expense_date.setDate(ledger_date)
+        self._set_combo_data(self.expense_account, account_id)
+        self.expense_memo.clearEditText()
+        self.expense_amount.setValue(0)
+
+        self.income_date.setDate(ledger_date)
+        self._set_combo_data(self.income_account, account_id)
+        self.income_memo.clearEditText()
+        self.income_amount.setValue(0)
+
+        self.transfer_date.setDate(ledger_date)
+        self._set_combo_data(self.transfer_from, account_id)
+        if self.transfer_to.currentData() == account_id:
+            for index in range(self.transfer_to.count()):
+                if self.transfer_to.itemData(index) != account_id:
+                    self.transfer_to.setCurrentIndex(index)
+                    break
+        self.transfer_memo.clearEditText()
+        self.transfer_amount.setValue(0)
+
+        self.transaction_tabs.setCurrentIndex(0)
+        self._sync_transaction_edit_controls()
 
     def _sync_transaction_edit_controls(self) -> None:
         editing_type = self.editing_transaction_type
@@ -967,15 +988,20 @@ class KakeiboWindow(QMainWindow):
             "income": (self.income_update_button, self.income_cancel_edit_button),
             "transfer": (self.transfer_update_button, self.transfer_cancel_edit_button),
         }
-        for transaction_type, buttons in edit_controls.items():
-            enabled = editing_type == transaction_type
-            for button in buttons:
-                button.setEnabled(enabled)
+        for transaction_type, (update_button, cancel_button) in edit_controls.items():
+            update_button.setEnabled(editing_type == transaction_type)
+            cancel_button.setEnabled(
+                editing_type == transaction_type or (self.return_to_ledger_after_transaction and not is_editing)
+            )
 
     def cancel_transaction_edit(self) -> None:
         self.editing_transaction_id = None
         self.editing_transaction_type = None
+        return_to_ledger = self.return_to_ledger_after_transaction
+        self.return_to_ledger_after_transaction = False
         self._sync_transaction_edit_controls()
+        if return_to_ledger:
+            self.transaction_tabs.setCurrentIndex(3)
 
     def selected_transaction_id(self) -> int | None:
         row = self.transaction_table.currentRow()
@@ -984,8 +1010,24 @@ class KakeiboWindow(QMainWindow):
         item = self.transaction_table.item(row, 0)
         return int(item.text()) if item else None
 
+    def selected_ledger_transaction_id(self) -> int | None:
+        row = self.ledger_table.currentRow()
+        if row < 0:
+            return None
+        item = self.ledger_table.item(row, 0)
+        if item is None or not item.text():
+            return None
+        return int(item.text())
+
     def selected_transaction(self) -> Transaction | None:
         transaction_id = self.selected_transaction_id()
+        return self.transaction_by_id(transaction_id)
+
+    def selected_ledger_transaction(self) -> Transaction | None:
+        transaction_id = self.selected_ledger_transaction_id()
+        return self.transaction_by_id(transaction_id)
+
+    def transaction_by_id(self, transaction_id: int | None) -> Transaction | None:
         if transaction_id is None:
             return None
         return next(
@@ -1019,9 +1061,19 @@ class KakeiboWindow(QMainWindow):
         if tx is None:
             QMessageBox.information(self, "取引編集", "編集する取引を選択してください。")
             return
+        self.load_transaction_for_edit(tx, return_to_ledger=False)
 
+    def load_selected_ledger_transaction_for_edit(self) -> None:
+        tx = self.selected_ledger_transaction()
+        if tx is None:
+            QMessageBox.information(self, "口座元帳", "変更する取引行を選択してください。")
+            return
+        self.load_transaction_for_edit(tx, return_to_ledger=True)
+
+    def load_transaction_for_edit(self, tx: Transaction, return_to_ledger: bool) -> None:
         self.editing_transaction_id = tx.id
         self.editing_transaction_type = tx.transaction_type
+        self.return_to_ledger_after_transaction = return_to_ledger
         tx_date = QDate.fromString(tx.occurred_on, "yyyy-MM-dd")
         if not tx_date.isValid():
             tx_date = QDate.currentDate()
@@ -1106,7 +1158,7 @@ class KakeiboWindow(QMainWindow):
 
         self.editing_transaction_id = None
         self.editing_transaction_type = None
-        self.refresh()
+        self.finish_transaction_entry()
 
     def save_memo_template(self, memo_input: QComboBox, usage_type: str) -> None:
         try:
@@ -1353,6 +1405,16 @@ class KakeiboWindow(QMainWindow):
         if transaction is None:
             QMessageBox.information(self, "削除", "削除する取引を選択してください。")
             return
+        self.delete_transaction_with_confirmation(transaction)
+
+    def delete_selected_ledger_transaction(self) -> None:
+        transaction = self.selected_ledger_transaction()
+        if transaction is None:
+            QMessageBox.information(self, "口座元帳", "削除する取引行を選択してください。")
+            return
+        self.delete_transaction_with_confirmation(transaction)
+
+    def delete_transaction_with_confirmation(self, transaction: Transaction) -> None:
         labels = {"expense": "支出", "income": "収入", "transfer": "移動"}
         reply = QMessageBox.question(
             self,

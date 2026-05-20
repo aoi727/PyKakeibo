@@ -103,7 +103,7 @@ class KakeiboWindow(QMainWindow):
         self.settings = QSettings("Honlabo", "PyKakeibo")
         self.editing_transaction_id: int | None = None
         self.editing_transaction_type: str | None = None
-        self.return_to_ledger_after_transaction = False
+        self.return_tab_after_transaction: int | None = None
         self.selected_month = date.today().replace(day=1)
 
         self.setWindowTitle("家計管理")
@@ -194,6 +194,15 @@ class KakeiboWindow(QMainWindow):
         self.transaction_table.cellDoubleClicked.connect(
             lambda _row, _column: self.load_selected_transaction_for_edit()
         )
+        self.search_keyword = QLineEdit()
+        self.search_keyword.setPlaceholderText("金額、摘要、カテゴリ、口座名など")
+        self.search_keyword.returnPressed.connect(self.search_transactions)
+        self.search_period = QComboBox()
+        self.search_period.addItem("本年度", "fiscal_year")
+        self.search_period.addItem("全記録期間", "all")
+        self.search_results: list[Transaction] = []
+        self.search_table = self._transaction_table()
+        self.search_period.currentIndexChanged.connect(lambda _index: self.search_transactions())
         self.account_table = self._account_table()
         self.category_table = self._category_table()
         self.memo_template_table = self._memo_template_table()
@@ -341,6 +350,7 @@ class KakeiboWindow(QMainWindow):
         self.transaction_tabs.addTab(self._expense_tab(), "支出")
         self.transaction_tabs.addTab(self._income_tab(), "収入")
         self.transaction_tabs.addTab(self._transfer_tab(), "資金移動")
+        self.transaction_tabs.addTab(self._search_tab(), "取引検索")
         self.transaction_tabs.addTab(self._ledger_tab(), "口座元帳")
         self.transaction_tabs.addTab(self._category_ledger_tab(), "カテゴリ元帳")
         self.transaction_tabs.addTab(self._trial_balance_tab(), "試算表")
@@ -355,12 +365,15 @@ class KakeiboWindow(QMainWindow):
         history_header = QHBoxLayout()
         edit_button = QPushButton("選択取引を編集")
         edit_button.clicked.connect(self.load_selected_transaction_for_edit)
+        copy_button = QPushButton("コピー")
+        copy_button.clicked.connect(self.copy_selected_transaction)
         delete_button = QPushButton("選択行を削除")
         delete_button.setObjectName("deleteButton")
         delete_button.clicked.connect(self.delete_selected_transaction)
         history_header.addWidget(self.history_label)
         history_header.addStretch()
         history_header.addWidget(edit_button)
+        history_header.addWidget(copy_button)
         history_header.addWidget(delete_button)
         history_layout.addLayout(history_header)
         history_layout.addWidget(self.transaction_table)
@@ -512,6 +525,29 @@ class KakeiboWindow(QMainWindow):
         layout.addWidget(self.transfer_cancel_edit_button, 2, 5)
         return tab
 
+    def _search_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("検索"))
+        controls.addWidget(self.search_keyword, 1)
+        controls.addWidget(QLabel("期間"))
+        controls.addWidget(self.search_period)
+        search_button = QPushButton("検索")
+        search_button.clicked.connect(self.search_transactions)
+        clear_button = QPushButton("クリア")
+        clear_button.clicked.connect(self.clear_transaction_search)
+        copy_button = QPushButton("コピー")
+        copy_button.clicked.connect(self.copy_selected_search_transaction)
+        controls.addWidget(search_button)
+        controls.addWidget(clear_button)
+        controls.addWidget(copy_button)
+
+        layout.addLayout(controls)
+        layout.addWidget(self.search_table)
+        return tab
+
     def _ledger_tab(self) -> QWidget:
         tab = QWidget()
         layout = QVBoxLayout(tab)
@@ -523,6 +559,8 @@ class KakeiboWindow(QMainWindow):
         add_button.clicked.connect(self.add_transaction_from_ledger)
         edit_button = QPushButton("変更")
         edit_button.clicked.connect(self.load_selected_ledger_transaction_for_edit)
+        copy_button = QPushButton("コピー")
+        copy_button.clicked.connect(self.copy_selected_ledger_transaction)
         delete_button = QPushButton("削除")
         delete_button.setObjectName("deleteButton")
         delete_button.clicked.connect(self.delete_selected_ledger_transaction)
@@ -530,6 +568,7 @@ class KakeiboWindow(QMainWindow):
         export_button.clicked.connect(self.export_ledger_pdf)
         controls.addWidget(add_button)
         controls.addWidget(edit_button)
+        controls.addWidget(copy_button)
         controls.addWidget(delete_button)
         controls.addWidget(export_button)
         layout.addLayout(controls)
@@ -545,8 +584,21 @@ class KakeiboWindow(QMainWindow):
         controls.addWidget(QLabel("カテゴリ"))
         controls.addWidget(self.category_ledger_category)
         controls.addStretch()
+        add_button = QPushButton("追加")
+        add_button.clicked.connect(self.add_transaction_from_category_ledger)
+        edit_button = QPushButton("変更")
+        edit_button.clicked.connect(self.load_selected_category_ledger_transaction_for_edit)
+        copy_button = QPushButton("コピー")
+        copy_button.clicked.connect(self.copy_selected_category_ledger_transaction)
+        delete_button = QPushButton("削除")
+        delete_button.setObjectName("deleteButton")
+        delete_button.clicked.connect(self.delete_selected_category_ledger_transaction)
         export_button = QPushButton("PDF保存")
         export_button.clicked.connect(self.export_category_ledger_pdf)
+        controls.addWidget(add_button)
+        controls.addWidget(edit_button)
+        controls.addWidget(copy_button)
+        controls.addWidget(delete_button)
         controls.addWidget(export_button)
         layout.addLayout(controls)
         layout.addWidget(self.category_ledger_table)
@@ -840,11 +892,11 @@ class KakeiboWindow(QMainWindow):
         self.finish_transaction_entry()
 
     def finish_transaction_entry(self) -> None:
-        return_to_ledger = self.return_to_ledger_after_transaction
-        self.return_to_ledger_after_transaction = False
+        return_tab = self.return_tab_after_transaction
+        self.return_tab_after_transaction = None
         self.refresh()
-        if return_to_ledger:
-            self.transaction_tabs.setCurrentIndex(3)
+        if return_tab is not None:
+            self.transaction_tabs.setCurrentIndex(return_tab)
 
     def add_transaction_from_ledger(self) -> None:
         if self.editing_transaction_id is not None:
@@ -856,7 +908,7 @@ class KakeiboWindow(QMainWindow):
             return
 
         ledger_date = QDate(self.selected_month.year, self.selected_month.month, 1)
-        self.return_to_ledger_after_transaction = True
+        self.return_tab_after_transaction = 4
 
         self.expense_date.setDate(ledger_date)
         self._set_combo_data(self.expense_account, account_id)
@@ -881,6 +933,32 @@ class KakeiboWindow(QMainWindow):
         self.transaction_tabs.setCurrentIndex(0)
         self._sync_transaction_edit_controls()
 
+    def add_transaction_from_category_ledger(self) -> None:
+        if self.editing_transaction_id is not None:
+            QMessageBox.information(self, "カテゴリ元帳", "取引編集中は新規追加できません。")
+            return
+        transaction_type = self.category_ledger_type.currentData()
+        category = self.category_ledger_category.currentText()
+        if transaction_type not in ("expense", "income") or not category:
+            QMessageBox.information(self, "カテゴリ元帳", "取引を追加するカテゴリを選択してください。")
+            return
+
+        ledger_date = QDate(self.selected_month.year, self.selected_month.month, 1)
+        self.return_tab_after_transaction = 5
+        if transaction_type == "expense":
+            self.expense_date.setDate(ledger_date)
+            self._set_combo_text(self.expense_category, category)
+            self.expense_memo.clearEditText()
+            self.expense_amount.setValue(0)
+            self.transaction_tabs.setCurrentIndex(0)
+        else:
+            self.income_date.setDate(ledger_date)
+            self._set_combo_text(self.income_category, category)
+            self.income_memo.clearEditText()
+            self.income_amount.setValue(0)
+            self.transaction_tabs.setCurrentIndex(1)
+        self._sync_transaction_edit_controls()
+
     def _sync_transaction_edit_controls(self) -> None:
         editing_type = self.editing_transaction_type
         is_editing = editing_type is not None
@@ -896,17 +974,17 @@ class KakeiboWindow(QMainWindow):
         for transaction_type, (update_button, cancel_button) in edit_controls.items():
             update_button.setEnabled(editing_type == transaction_type)
             cancel_button.setEnabled(
-                editing_type == transaction_type or (self.return_to_ledger_after_transaction and not is_editing)
+                editing_type == transaction_type or (self.return_tab_after_transaction is not None and not is_editing)
             )
 
     def cancel_transaction_edit(self) -> None:
         self.editing_transaction_id = None
         self.editing_transaction_type = None
-        return_to_ledger = self.return_to_ledger_after_transaction
-        self.return_to_ledger_after_transaction = False
+        return_tab = self.return_tab_after_transaction
+        self.return_tab_after_transaction = None
         self._sync_transaction_edit_controls()
-        if return_to_ledger:
-            self.transaction_tabs.setCurrentIndex(3)
+        if return_tab is not None:
+            self.transaction_tabs.setCurrentIndex(return_tab)
 
     def selected_transaction_id(self) -> int | None:
         row = self.transaction_table.currentRow()
@@ -924,6 +1002,22 @@ class KakeiboWindow(QMainWindow):
             return None
         return int(item.text())
 
+    def selected_search_transaction_id(self) -> int | None:
+        row = self.search_table.currentRow()
+        if row < 0:
+            return None
+        item = self.search_table.item(row, 0)
+        return int(item.text()) if item else None
+
+    def selected_category_ledger_transaction_id(self) -> int | None:
+        row = self.category_ledger_table.currentRow()
+        if row < 0:
+            return None
+        item = self.category_ledger_table.item(row, 0)
+        if item is None or not item.text():
+            return None
+        return int(item.text())
+
     def selected_transaction(self) -> Transaction | None:
         transaction_id = self.selected_transaction_id()
         return self.transaction_by_id(transaction_id)
@@ -932,13 +1026,26 @@ class KakeiboWindow(QMainWindow):
         transaction_id = self.selected_ledger_transaction_id()
         return self.transaction_by_id(transaction_id)
 
+    def selected_search_transaction(self) -> Transaction | None:
+        transaction_id = self.selected_search_transaction_id()
+        return self.transaction_by_id(transaction_id)
+
+    def selected_category_ledger_transaction(self) -> Transaction | None:
+        transaction_id = self.selected_category_ledger_transaction_id()
+        return self.transaction_by_id(transaction_id)
+
     def transaction_by_id(self, transaction_id: int | None) -> Transaction | None:
         if transaction_id is None:
             return None
-        return next(
-            (transaction for transaction in self.transactions if transaction.id == transaction_id),
+        transaction = next(
+            (
+                transaction
+                for transaction in [*self.transactions, *self.search_results]
+                if transaction.id == transaction_id
+            ),
             None,
         )
+        return transaction if transaction is not None else self.store.get_transaction(transaction_id)
 
     def _set_combo_data(self, combo: QComboBox, data: int | None) -> None:
         if data is None:
@@ -966,23 +1073,72 @@ class KakeiboWindow(QMainWindow):
         if tx is None:
             QMessageBox.information(self, "取引編集", "編集する取引を選択してください。")
             return
-        self.load_transaction_for_edit(tx, return_to_ledger=False)
+        self.load_transaction_for_edit(tx, return_tab_index=None)
 
     def load_selected_ledger_transaction_for_edit(self) -> None:
         tx = self.selected_ledger_transaction()
         if tx is None:
             QMessageBox.information(self, "口座元帳", "変更する取引行を選択してください。")
             return
-        self.load_transaction_for_edit(tx, return_to_ledger=True)
+        self.load_transaction_for_edit(tx, return_tab_index=4)
 
-    def load_transaction_for_edit(self, tx: Transaction, return_to_ledger: bool) -> None:
+    def load_selected_category_ledger_transaction_for_edit(self) -> None:
+        tx = self.selected_category_ledger_transaction()
+        if tx is None:
+            QMessageBox.information(self, "カテゴリ元帳", "変更する取引行を選択してください。")
+            return
+        self.load_transaction_for_edit(tx, return_tab_index=5)
+
+    def load_transaction_for_edit(self, tx: Transaction, return_tab_index: int | None) -> None:
         self.editing_transaction_id = tx.id
         self.editing_transaction_type = tx.transaction_type
-        self.return_to_ledger_after_transaction = return_to_ledger
+        self.return_tab_after_transaction = return_tab_index
         tx_date = QDate.fromString(tx.occurred_on, "yyyy-MM-dd")
         if not tx_date.isValid():
             tx_date = QDate.currentDate()
 
+        self.load_transaction_into_entry_form(tx, tx_date)
+        self._sync_transaction_edit_controls()
+
+    def copy_selected_transaction(self) -> None:
+        tx = self.selected_transaction()
+        if tx is None:
+            QMessageBox.information(self, "取引コピー", "コピーする取引を選択してください。")
+            return
+        self.copy_transaction_to_entry_form(tx, return_tab_index=self.transaction_tabs.currentIndex())
+
+    def copy_selected_search_transaction(self) -> None:
+        tx = self.selected_search_transaction()
+        if tx is None:
+            QMessageBox.information(self, "取引コピー", "コピーする取引を選択してください。")
+            return
+        self.copy_transaction_to_entry_form(tx, return_tab_index=3)
+
+    def copy_selected_ledger_transaction(self) -> None:
+        tx = self.selected_ledger_transaction()
+        if tx is None:
+            QMessageBox.information(self, "口座元帳", "コピーする取引行を選択してください。")
+            return
+        self.copy_transaction_to_entry_form(tx, return_tab_index=4)
+
+    def copy_selected_category_ledger_transaction(self) -> None:
+        tx = self.selected_category_ledger_transaction()
+        if tx is None:
+            QMessageBox.information(self, "カテゴリ元帳", "コピーする取引行を選択してください。")
+            return
+        self.copy_transaction_to_entry_form(tx, return_tab_index=5)
+
+    def copy_transaction_to_entry_form(self, tx: Transaction, return_tab_index: int | None) -> None:
+        self.editing_transaction_id = None
+        self.editing_transaction_type = None
+        self.return_tab_after_transaction = return_tab_index
+        tx_date = QDate.fromString(tx.occurred_on, "yyyy-MM-dd")
+        if not tx_date.isValid():
+            tx_date = QDate.currentDate()
+        self.load_transaction_into_entry_form(tx, tx_date)
+        self._sync_transaction_edit_controls()
+
+    def load_transaction_into_entry_form(self, tx: Transaction, tx_date: QDate) -> None:
         if tx.transaction_type == "expense":
             self.transaction_tabs.setCurrentIndex(0)
             self.expense_date.setDate(tx_date)
@@ -1004,7 +1160,6 @@ class KakeiboWindow(QMainWindow):
             self._set_combo_data(self.transfer_to, tx.to_account_id)
             self.transfer_memo.setEditText(tx.memo)
             self.transfer_amount.setValue(tx.amount)
-        self._sync_transaction_edit_controls()
 
     def update_editing_transaction(self) -> None:
         if self.editing_transaction_id is None or self.editing_transaction_type is None:
@@ -1319,6 +1474,13 @@ class KakeiboWindow(QMainWindow):
             return
         self.delete_transaction_with_confirmation(transaction)
 
+    def delete_selected_category_ledger_transaction(self) -> None:
+        transaction = self.selected_category_ledger_transaction()
+        if transaction is None:
+            QMessageBox.information(self, "カテゴリ元帳", "削除する取引行を選択してください。")
+            return
+        self.delete_transaction_with_confirmation(transaction)
+
     def delete_transaction_with_confirmation(self, transaction: Transaction) -> None:
         labels = {"expense": "支出", "income": "収入", "transfer": "移動"}
         reply = QMessageBox.question(
@@ -1461,6 +1623,10 @@ class KakeiboWindow(QMainWindow):
         )
         return self.selected_month, next_month
 
+    def selected_fiscal_year_range(self) -> tuple[date, date]:
+        fiscal_year = self.selected_month.year if self.selected_month.month >= 4 else self.selected_month.year - 1
+        return date(fiscal_year, 4, 1), date(fiscal_year + 1, 4, 1)
+
     def selected_month_text(self) -> str:
         return f"{self.selected_month.year}年{self.selected_month.month}月"
 
@@ -1511,6 +1677,7 @@ class KakeiboWindow(QMainWindow):
         self._render_memo_templates()
         self._render_account_panel()
         self._render_summary()
+        self.search_transactions()
         self._sync_transaction_edit_controls()
 
     def _refresh_month_labels(self) -> None:
@@ -1609,9 +1776,26 @@ class KakeiboWindow(QMainWindow):
         self._render_category_breakdown(by_category, expense_total)
 
     def _render_transactions(self) -> None:
+        self._fill_transaction_table(self.transaction_table, self.transactions)
+
+    def search_transactions(self) -> None:
+        period = self.search_period.currentData()
+        if period == "all":
+            start_date = None
+            end_date = None
+        else:
+            start_date, end_date = self.selected_fiscal_year_range()
+        self.search_results = self.store.search_transactions(self.search_keyword.text(), start_date, end_date)
+        self._fill_transaction_table(self.search_table, self.search_results)
+
+    def clear_transaction_search(self) -> None:
+        self.search_keyword.clear()
+        self.search_transactions()
+
+    def _fill_transaction_table(self, table: QTableWidget, transactions: list[Transaction]) -> None:
         labels = {"expense": "支出", "income": "収入", "transfer": "移動"}
-        self.transaction_table.setRowCount(len(self.transactions))
-        for row, tx in enumerate(self.transactions):
+        table.setRowCount(len(transactions))
+        for row, tx in enumerate(transactions):
             values = [
                 str(tx.id),
                 tx.occurred_on,
@@ -1626,7 +1810,7 @@ class KakeiboWindow(QMainWindow):
                 item = QTableWidgetItem(value)
                 if column == 7:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                self.transaction_table.setItem(row, column, item)
+                table.setItem(row, column, item)
 
     def _render_account_ledger(self) -> None:
         account_id = self.ledger_account.currentData()

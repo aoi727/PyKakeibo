@@ -819,6 +819,95 @@ class KakeiboStore:
             ).fetchall()
         return [Transaction(**dict(row)) for row in rows]
 
+    def search_transactions(
+        self,
+        keyword: str,
+        start_date: date | None = None,
+        end_date: date | None = None,
+    ) -> list[Transaction]:
+        conditions: list[str] = []
+        params: list[str] = []
+
+        if start_date is not None and end_date is not None:
+            conditions.append("t.occurred_on >= ? AND t.occurred_on < ?")
+            params.extend([start_date.isoformat(), end_date.isoformat()])
+
+        text = keyword.strip()
+        if text:
+            like_text = f"%{text}%"
+            search_conditions = [
+                "t.occurred_on LIKE ?",
+                "COALESCE(t.category, '') LIKE ?",
+                "COALESCE(t.memo, '') LIKE ?",
+                "COALESCE(f.name, '') LIKE ?",
+                "COALESCE(ta.name, '') LIKE ?",
+                """
+                CASE t.transaction_type
+                    WHEN 'expense' THEN '支出'
+                    WHEN 'income' THEN '収入'
+                    WHEN 'transfer' THEN '資金移動'
+                    ELSE t.transaction_type
+                END LIKE ?
+                """,
+            ]
+            params.extend([like_text] * len(search_conditions))
+
+            amount_text = "".join(char for char in text if char.isdigit())
+            if amount_text:
+                search_conditions.append("CAST(t.amount AS TEXT) LIKE ?")
+                params.append(f"%{amount_text}%")
+
+            conditions.append(f"({' OR '.join(search_conditions)})")
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        with self._connect() as conn:
+            rows = conn.execute(
+                f"""
+                SELECT
+                    t.id,
+                    t.occurred_on,
+                    t.transaction_type,
+                    COALESCE(t.category, '') AS category,
+                    t.from_account_id,
+                    t.to_account_id,
+                    COALESCE(f.name, '') AS from_account_name,
+                    COALESCE(ta.name, '') AS to_account_name,
+                    t.memo,
+                    t.amount
+                FROM transactions t
+                LEFT JOIN accounts f ON f.id = t.from_account_id
+                LEFT JOIN accounts ta ON ta.id = t.to_account_id
+                {where}
+                ORDER BY t.occurred_on DESC, t.id DESC
+                """,
+                tuple(params),
+            ).fetchall()
+        return [Transaction(**dict(row)) for row in rows]
+
+    def get_transaction(self, transaction_id: int) -> Transaction | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT
+                    t.id,
+                    t.occurred_on,
+                    t.transaction_type,
+                    COALESCE(t.category, '') AS category,
+                    t.from_account_id,
+                    t.to_account_id,
+                    COALESCE(f.name, '') AS from_account_name,
+                    COALESCE(ta.name, '') AS to_account_name,
+                    t.memo,
+                    t.amount
+                FROM transactions t
+                LEFT JOIN accounts f ON f.id = t.from_account_id
+                LEFT JOIN accounts ta ON ta.id = t.to_account_id
+                WHERE t.id = ?
+                """,
+                (transaction_id,),
+            ).fetchone()
+        return Transaction(**dict(row)) if row is not None else None
+
     def monthly_totals(self, month_start: date, next_month_start: date) -> tuple[int, int, dict[str, int]]:
         with self._connect() as conn:
             rows = conn.execute(

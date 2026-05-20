@@ -198,8 +198,8 @@ class KakeiboWindow(QMainWindow):
         self.search_keyword.setPlaceholderText("金額、摘要、カテゴリ、口座名など")
         self.search_keyword.returnPressed.connect(self.search_transactions)
         self.search_period = QComboBox()
-        self.search_period.addItem("本年度", "fiscal_year")
         self.search_period.addItem("全記録期間", "all")
+        self.search_period.addItem("本年度", "fiscal_year")
         self.search_results: list[Transaction] = []
         self.search_table = self._transaction_table()
         self.search_period.currentIndexChanged.connect(lambda _index: self.search_transactions())
@@ -1683,8 +1683,8 @@ class KakeiboWindow(QMainWindow):
     def _refresh_month_labels(self) -> None:
         month_text = self.selected_month_text()
         self.month_label.setText(month_text)
-        self.expense_card.set_title(f"{month_text}の支出（資金移動を含む）")
-        self.income_card.set_title(f"{month_text}の収入（資金移動を含む）")
+        self.expense_card.set_title(f"{month_text}の支出")
+        self.income_card.set_title(f"{month_text}の収入")
         self.history_label.setText(f"{month_text}の取引")
         self.category_title.setText(f"{month_text}の支出内訳")
 

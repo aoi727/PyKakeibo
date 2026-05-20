@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+import unicodedata
 from datetime import date
 from pathlib import Path
 
@@ -226,7 +227,8 @@ class KakeiboStore:
             )
             return int(cur.lastrowid)
 
-    def add_account(self, name: str, account_type: str, opening_balance: int) -> None:
+    def add_account(self, name: str, account_type: str, opening_balance: int | str) -> None:
+        opening_balance_value = self.normalize_amount(opening_balance, allow_negative=True)
         with self._connect() as conn:
             sort_order = conn.execute(
                 "SELECT COALESCE(MAX(sort_order), -1) + 1 FROM accounts"
@@ -236,10 +238,11 @@ class KakeiboStore:
                 INSERT INTO accounts (name, account_type, opening_balance, sort_order)
                 VALUES (?, ?, ?, ?)
                 """,
-                (name, account_type, opening_balance, sort_order),
+                (name, account_type, opening_balance_value, sort_order),
             )
 
-    def update_account(self, account_id: int, name: str, account_type: str, opening_balance: int) -> None:
+    def update_account(self, account_id: int, name: str, account_type: str, opening_balance: int | str) -> None:
+        opening_balance_value = self.normalize_amount(opening_balance, allow_negative=True)
         with self._connect() as conn:
             conn.execute(
                 """
@@ -247,7 +250,7 @@ class KakeiboStore:
                 SET name = ?, account_type = ?, opening_balance = ?
                 WHERE id = ?
                 """,
-                (name, account_type, opening_balance, account_id),
+                (name, account_type, opening_balance_value, account_id),
             )
 
     def set_account_active(self, account_id: int, is_active: bool) -> None:
@@ -665,13 +668,13 @@ class KakeiboStore:
             )
         return entries
 
-    def add_expense(self, occurred_on: str, account_id: int, category: str, memo: str, amount: int) -> None:
+    def add_expense(self, occurred_on: str, account_id: int, category: str, memo: str, amount: int | str) -> None:
         self._add_transaction(occurred_on, "expense", category, account_id, None, memo, amount)
 
-    def add_income(self, occurred_on: str, account_id: int, category: str, memo: str, amount: int) -> None:
+    def add_income(self, occurred_on: str, account_id: int, category: str, memo: str, amount: int | str) -> None:
         self._add_transaction(occurred_on, "income", category, None, account_id, memo, amount)
 
-    def add_transfer(self, occurred_on: str, from_account_id: int, to_account_id: int, memo: str, amount: int) -> None:
+    def add_transfer(self, occurred_on: str, from_account_id: int, to_account_id: int, memo: str, amount: int | str) -> None:
         if from_account_id == to_account_id:
             raise ValueError("移動元と移動先は別の口座を選んでください。")
         self._add_transaction(occurred_on, "transfer", "資金移動", from_account_id, to_account_id, memo, amount)
@@ -684,8 +687,11 @@ class KakeiboStore:
         from_account_id: int | None,
         to_account_id: int | None,
         memo: str,
-        amount: int,
+        amount: int | str,
     ) -> None:
+        amount_value = self.normalize_amount(amount)
+        if amount_value <= 0:
+            raise ValueError("取引金額は1円以上で入力してください。")
         with self._connect() as conn:
             conn.execute(
                 """
@@ -694,7 +700,7 @@ class KakeiboStore:
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (occurred_on, transaction_type, category, from_account_id, to_account_id, memo, amount),
+                (occurred_on, transaction_type, category, from_account_id, to_account_id, memo, amount_value),
             )
 
     def delete_transaction(self, transaction_id: int) -> None:
@@ -710,10 +716,13 @@ class KakeiboStore:
         from_account_id: int | None,
         to_account_id: int | None,
         memo: str,
-        amount: int,
+        amount: int | str,
     ) -> None:
         if transaction_type == "transfer" and from_account_id == to_account_id:
             raise ValueError("移動元と移動先は別の口座を選んでください。")
+        amount_value = self.normalize_amount(amount)
+        if amount_value <= 0:
+            raise ValueError("取引金額は1円以上で入力してください。")
         with self._connect() as conn:
             conn.execute(
                 """
@@ -734,7 +743,7 @@ class KakeiboStore:
                     from_account_id,
                     to_account_id,
                     memo,
-                    amount,
+                    amount_value,
                     transaction_id,
                 ),
             )
@@ -832,7 +841,7 @@ class KakeiboStore:
             conditions.append("t.occurred_on >= ? AND t.occurred_on < ?")
             params.extend([start_date.isoformat(), end_date.isoformat()])
 
-        text = keyword.strip()
+        text = unicodedata.normalize("NFKC", keyword).strip()
         if text:
             like_text = f"%{text}%"
             search_conditions = [
@@ -852,8 +861,10 @@ class KakeiboStore:
             ]
             params.extend([like_text] * len(search_conditions))
 
-            amount_text = "".join(char for char in text if char.isdigit())
+            amount_text = self._amount_search_text(text)
             if amount_text:
+                search_conditions.append("t.amount = ?")
+                params.append(amount_text)
                 search_conditions.append("CAST(t.amount AS TEXT) LIKE ?")
                 params.append(f"%{amount_text}%")
 
@@ -883,6 +894,31 @@ class KakeiboStore:
                 tuple(params),
             ).fetchall()
         return [Transaction(**dict(row)) for row in rows]
+
+    @staticmethod
+    def _amount_search_text(text: str) -> str:
+        return "".join(char for char in text if char.isdecimal())
+
+    @staticmethod
+    def normalize_amount(value: int | str, allow_negative: bool = False) -> int:
+        if isinstance(value, int):
+            return value
+
+        text = unicodedata.normalize("NFKC", str(value)).strip()
+        for removable in ("¥", "円", ","):
+            text = text.replace(removable, "")
+        text = "".join(char for char in text if not char.isspace())
+
+        if allow_negative and text.startswith("-"):
+            number_text = text[1:]
+            sign = -1
+        else:
+            number_text = text
+            sign = 1
+
+        if not number_text.isdecimal():
+            raise ValueError("金額は整数で入力してください。")
+        return sign * int(number_text)
 
     def get_transaction(self, transaction_id: int) -> Transaction | None:
         with self._connect() as conn:
@@ -915,6 +951,7 @@ class KakeiboStore:
                 SELECT transaction_type, COALESCE(category, '') AS category, SUM(amount) AS total
                 FROM transactions
                 WHERE occurred_on >= ? AND occurred_on < ?
+                    AND transaction_type IN ('expense', 'income')
                 GROUP BY transaction_type, COALESCE(category, '')
                 """,
                 (month_start.isoformat(), next_month_start.isoformat()),
